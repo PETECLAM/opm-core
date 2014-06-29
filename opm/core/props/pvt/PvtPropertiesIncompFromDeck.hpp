@@ -20,8 +20,7 @@
 #ifndef OPM_PVTPROPERTIESINCOMPFROMDECK_HEADER_INCLUDED
 #define OPM_PVTPROPERTIESINCOMPFROMDECK_HEADER_INCLUDED
 
-
-#include <opm/core/io/eclipse/EclipseGridParser.hpp>
+#include <opm/parser/eclipse/Deck/Deck.hpp>
 #include <array>
 
 namespace Opm
@@ -39,7 +38,7 @@ namespace Opm
         PvtPropertiesIncompFromDeck();
 
         /// Initialize from deck.
-        void init(const EclipseGridParser& deck);
+        void init(Opm::DeckConstPtr deck);
 
         /// Number of active phases.
         int numPhases() const;

@@ -20,8 +20,15 @@
 #ifndef OPM_CORNERPOINTCHOPPER_HEADER_INCLUDED
 #define OPM_CORNERPOINTCHOPPER_HEADER_INCLUDED
 
-#include <opm/core/io/eclipse/EclipseGridParser.hpp>
 #include <opm/core/utility/parameters/ParameterGroup.hpp>
+#include <opm/parser/eclipse/Parser/Parser.hpp>
+#include <opm/parser/eclipse/Units/UnitSystem.hpp>
+#include <opm/parser/eclipse/Deck/Deck.hpp>
+#include <opm/parser/eclipse/Deck/DeckKeyword.hpp>
+#include <opm/parser/eclipse/Deck/DeckRecord.hpp>
+#include <opm/parser/eclipse/Deck/DeckDoubleItem.hpp>
+#include <opm/parser/eclipse/Deck/DeckIntItem.hpp>
+#include <opm/parser/eclipse/Deck/DeckStringItem.hpp>
 #include <iostream>
 #include <fstream>
 #include <string>
@@ -36,14 +43,19 @@ namespace Opm
     {
     public:
         CornerPointChopper(const std::string& file)
-            : parser_(file, false)
         {
-            for (int dd = 0; dd < 3; ++dd) {
-                dims_[dd] = parser_.getSPECGRID().dimensions[dd];
-            }
+            Opm::ParserPtr parser(new Opm::Parser());
+            deck_ = parser->parseFile(file);
+
+            metricUnits_.reset(Opm::UnitSystem::newMETRIC());
+
+            Opm::DeckRecordConstPtr specgridRecord = deck_->getKeyword("SPECGRID")->getRecord(0);
+            dims_[0] = specgridRecord->getItem("NX")->getInt(0);
+            dims_[1] = specgridRecord->getItem("NY")->getInt(0);
+            dims_[2] = specgridRecord->getItem("NZ")->getInt(0);
 
             int layersz = 8*dims_[0]*dims_[1];
-            const std::vector<double>& ZCORN = parser_.getFloatingPointValue("ZCORN");
+            const std::vector<double>& ZCORN = deck_->getKeyword("ZCORN")->getRawDoubleData();
             botmax_ = *std::max_element(ZCORN.begin(), ZCORN.begin() + layersz/2);
             topmin_ = *std::min_element(ZCORN.begin() + dims_[2]*layersz - layersz/2,
                                         ZCORN.begin() + dims_[2]*layersz);
@@ -133,7 +145,7 @@ namespace Opm
             new_dims_[1] = jmax - jmin;
 
             // Filter the coord field
-            const std::vector<double>& COORD = parser_.getFloatingPointValue("COORD");
+            const std::vector<double>& COORD = deck_->getKeyword("COORD")->getRawDoubleData();
             int num_coord = COORD.size();
             if (num_coord != 6*(dims_[0] + 1)*(dims_[1] + 1)) {
                 std::cerr << "Error! COORD size (" << COORD.size() << ") not consistent with SPECGRID\n";
@@ -166,7 +178,7 @@ namespace Opm
             // coordinate of the bottom surface, while zmax must be less than or
             // equal to the lowest coordinate of the top surface.
             int layersz = 8*dims_[0]*dims_[1];
-            const std::vector<double>& ZCORN = parser_.getFloatingPointValue("ZCORN");
+            const std::vector<double>& ZCORN = deck_->getKeyword("ZCORN")->getRawDoubleData();
             int num_zcorn = ZCORN.size();
             if (num_zcorn != layersz*dims_[2]) {
                 std::cerr << "Error! ZCORN size (" << ZCORN.size() << ") not consistent with SPECGRID\n";
@@ -236,45 +248,56 @@ namespace Opm
             filterIntegerField("ACTNUM", new_ACTNUM_);
             filterDoubleField("PORO", new_PORO_);
             filterDoubleField("NTG", new_NTG_);
+            filterDoubleField("SWCR", new_SWCR_);
+            filterDoubleField("SOWCR", new_SOWCR_);
             filterDoubleField("PERMX", new_PERMX_);
             filterDoubleField("PERMY", new_PERMY_);
             filterDoubleField("PERMZ", new_PERMZ_);
             filterIntegerField("SATNUM", new_SATNUM_);
         }
 
-
-
-        /// Return a subparser with fields corresponding to the selected subset.
-        /// Note that the returned parser is NOT converted to SI, that must be done
-        /// by the user afterwards with the parser's convertToSI() method.
-        EclipseGridParser subparser()
+        /// Return a sub-deck with fields corresponding to the selected subset.
+        Opm::DeckConstPtr subDeck()
         {
-            if (parser_.hasField("FIELD") || parser_.hasField("LAB") || parser_.hasField("PVT-M")) {
-                OPM_THROW(std::runtime_error, "CornerPointChopper::subparser() cannot handle any eclipse unit system other than METRIC.");
-            }
+            Opm::DeckPtr subDeck(new Opm::Deck);
 
-            EclipseGridParser sp;
-            std::shared_ptr<SPECGRID> sg(new SPECGRID);
-            for (int dd = 0; dd < 3; ++dd) {
-                sg->dimensions[dd] = new_dims_[dd];
-            }
-            sp.setSpecialField("SPECGRID", sg);
-            sp.setFloatingPointField("COORD", new_COORD_);
-            sp.setFloatingPointField("ZCORN", new_ZCORN_);
-            if (!new_ACTNUM_.empty()) sp.setIntegerField("ACTNUM", new_ACTNUM_);
-            if (!new_PORO_.empty()) sp.setFloatingPointField("PORO", new_PORO_);
-            if (!new_NTG_.empty()) sp.setFloatingPointField("NTG", new_NTG_);
-            if (!new_PERMX_.empty()) sp.setFloatingPointField("PERMX", new_PERMX_);
-            if (!new_PERMY_.empty()) sp.setFloatingPointField("PERMY", new_PERMY_);
-            if (!new_PERMZ_.empty()) sp.setFloatingPointField("PERMZ", new_PERMZ_);
-            if (!new_SATNUM_.empty()) sp.setIntegerField("SATNUM", new_SATNUM_);
-            sp.computeUnits(); // Always METRIC, since that is default.
-            return sp;
+            Opm::DeckKeywordPtr specGridKw(new Opm::DeckKeyword("SPECGRID"));
+            Opm::DeckRecordPtr specGridRecord(new Opm::DeckRecord());
+
+            Opm::DeckIntItemPtr nxItem(new Opm::DeckIntItem("NX"));
+            Opm::DeckIntItemPtr nyItem(new Opm::DeckIntItem("NY"));
+            Opm::DeckIntItemPtr nzItem(new Opm::DeckIntItem("NZ"));
+            Opm::DeckIntItemPtr numresItem(new Opm::DeckIntItem("NUMRES"));
+            Opm::DeckStringItemPtr coordTypeItem(new Opm::DeckStringItem("COORD_TYPE"));
+
+            nxItem->push_back(new_dims_[0]);
+            nyItem->push_back(new_dims_[1]);
+            nzItem->push_back(new_dims_[2]);
+            numresItem->push_back(1);
+            coordTypeItem->push_back("F");
+
+            specGridRecord->addItem(nxItem);
+            specGridRecord->addItem(nyItem);
+            specGridRecord->addItem(nzItem);
+            specGridRecord->addItem(numresItem);
+            specGridRecord->addItem(coordTypeItem);
+
+            specGridKw->addRecord(specGridRecord);
+
+            subDeck->addKeyword(specGridKw);
+            addDoubleKeyword_(subDeck, "COORD", /*dimension=*/"Length", new_COORD_);
+            addDoubleKeyword_(subDeck, "ZCORN", /*dimension=*/"Length", new_ZCORN_);
+            addIntKeyword_(subDeck, "ACTNUM", new_ACTNUM_);
+            addDoubleKeyword_(subDeck, "PORO", /*dimension=*/"1", new_PORO_);
+            addDoubleKeyword_(subDeck, "NTG", /*dimension=*/"1", new_NTG_);
+            addDoubleKeyword_(subDeck, "SWCR", /*dimension=*/"1", new_SWCR_);
+            addDoubleKeyword_(subDeck, "SOWCR", /*dimension=*/"1", new_SOWCR_);
+            addDoubleKeyword_(subDeck, "PERMX", /*dimension=*/"Permeability", new_PERMX_);
+            addDoubleKeyword_(subDeck, "PERMY", /*dimension=*/"Permeability", new_PERMY_);
+            addDoubleKeyword_(subDeck, "PERMZ", /*dimension=*/"Permeability", new_PERMZ_);
+            addIntKeyword_(subDeck, "SATNUM", new_SATNUM_);
+            return subDeck;
         }
-
-
-
-
         void writeGrdecl(const std::string& filename)
         {
             // Output new versions of SPECGRID, COORD, ZCORN, ACTNUM, PERMX, PORO, SATNUM.
@@ -285,38 +308,27 @@ namespace Opm
             }
             out << "SPECGRID\n" << new_dims_[0] << ' ' << new_dims_[1] << ' ' << new_dims_[2]
                 << " 1 F\n/\n\n";
-            out << "COORD\n";
-            int num_new_coord = new_COORD_.size();
-            for (int i = 0; i < num_new_coord/6; ++i) {
-                for (int j = 0; j < 6; ++j) {
-                    out << "  " << new_COORD_[6*i + j];
-                }
-                out << '\n';
-            }
-            out << "/\n\n";
-            out << "ZCORN\n";
-            int num_new_zcorn = new_ZCORN_.size();
-            assert(num_new_zcorn%8 == 0);
-            for (int i = 0; i < num_new_zcorn/8; ++i) {
-                for (int j = 0; j < 8; ++j) {
-                    out << "  " << new_ZCORN_[8*i + j];
-                }
-                out << '\n';
-            }
-            out << "/\n\n";
 
+            outputField(out, new_COORD_, "COORD", /* nl = */ 6);
+            outputField(out, new_ZCORN_, "ZCORN", /* nl = */ 8);
             outputField(out, new_ACTNUM_, "ACTNUM");
             outputField(out, new_PORO_, "PORO");
             if (hasNTG()) {outputField(out, new_NTG_, "NTG");}
+            if (hasSWCR()) {outputField(out, new_SWCR_, "SWCR");}
+            if (hasSOWCR()) {outputField(out, new_SOWCR_, "SOWCR");}
             outputField(out, new_PERMX_, "PERMX");
             outputField(out, new_PERMY_, "PERMY");
             outputField(out, new_PERMZ_, "PERMZ");
             outputField(out, new_SATNUM_, "SATNUM");
         }
         bool hasNTG() const {return !new_NTG_.empty(); }
+        bool hasSWCR() const {return !new_SWCR_.empty(); }
+        bool hasSOWCR() const {return !new_SOWCR_.empty(); }
 
     private:
-        EclipseGridParser parser_;
+        Opm::DeckConstPtr deck_;
+        std::shared_ptr<Opm::UnitSystem> metricUnits_;
+
         double botmax_;
         double topmin_;
         double abszmin_;
@@ -326,6 +338,8 @@ namespace Opm
         std::vector<int> new_ACTNUM_;
         std::vector<double> new_PORO_;
         std::vector<double> new_NTG_;
+        std::vector<double> new_SWCR_;
+        std::vector<double> new_SOWCR_;
         std::vector<double> new_PERMX_;
         std::vector<double> new_PERMY_;
         std::vector<double> new_PERMZ_;
@@ -334,58 +348,73 @@ namespace Opm
         int new_dims_[3];
         std::vector<int> new_to_old_cell_;
 
+        void addDoubleKeyword_(Opm::DeckPtr subDeck,
+                               const std::string& keywordName,
+                               const std::string& dimensionString,
+                               const std::vector<double>& data)
+        {
+            if (data.empty())
+                return;
+
+            Opm::DeckKeywordPtr dataKw(new Opm::DeckKeyword(keywordName));
+            Opm::DeckRecordPtr dataRecord(new Opm::DeckRecord());
+            Opm::DeckDoubleItemPtr dataItem(new Opm::DeckDoubleItem("DATA"));
+
+            for (size_t i = 0; i < data.size(); ++i) {
+                dataItem->push_back(data[i]);
+            }
+
+            std::shared_ptr<const Dimension> dimension = metricUnits_->parse(dimensionString);
+            dataItem->push_backDimension(/*active=*/dimension, /*default=*/dimension);
+
+            dataRecord->addItem(dataItem);
+            dataKw->addRecord(dataRecord);
+            subDeck->addKeyword(dataKw);
+        }
+
+        void addIntKeyword_(Opm::DeckPtr subDeck,
+                               const std::string& keywordName,
+                               const std::vector<int>& data)
+        {
+            if (data.empty())
+                return;
+
+            Opm::DeckKeywordPtr dataKw(new Opm::DeckKeyword(keywordName));
+            Opm::DeckRecordPtr dataRecord(new Opm::DeckRecord());
+            Opm::DeckIntItemPtr dataItem(new Opm::DeckIntItem("DATA"));
+
+            for (size_t i = 0; i < data.size(); ++i) {
+                dataItem->push_back(data[i]);
+            }
+
+            dataRecord->addItem(dataItem);
+            dataKw->addRecord(dataRecord);
+            subDeck->addKeyword(dataKw);
+        }
 
         template <typename T>
         void outputField(std::ostream& os,
                          const std::vector<T>& field,
-                         const std::string& keyword)
+                         const std::string& keyword,
+                         const typename std::vector<T>::size_type nl = 20)
         {
             if (field.empty()) return;
 
             os << keyword << '\n';
-            int sz = field.size();
-            //int num_new_zcorn = new_ZCORN_.size();
-            //assert(sz%20 == 0);
-            const int nel_per_row = 20;
-            int num_full_rows=sz/nel_per_row;
-            int num_extra_entries=sz%nel_per_row;
-            for (int i = 0; i < num_full_rows; ++i) {
-                for (int j = 0; j < nel_per_row; ++j) {
-                    os << "  " << field[nel_per_row*i + j];
-                }
-                os << '\n';
+
+            typedef typename std::vector<T>::size_type sz_t;
+
+            const sz_t n = field.size();
+            for (sz_t i = 0; i < n; ++i) {
+                os << field[i]
+                   << (((i + 1) % nl == 0) ? '\n' : ' ');
             }
-            for (int i = 0; i < num_extra_entries; ++i) {
-                os << "  " << field[num_full_rows*nel_per_row+i];
+            if (n % nl != 0) {
+                os << '\n';
             }
             os << "/\n\n";
         }
 
-//            os << keyword << '\n';
-//            int sz = field.size();
-//            T last = std::numeric_limits<T>::max();
-//            int repeats = 0;
-//            for (int i = 0; i < sz; ++i) {
-//                T val = field[i];
-//                if (val == last) {
-//                    ++repeats;
-//                } else {
-//                    if (repeats == 1) {
-//                        os << last << '\n';
-//                    } else if (repeats > 1) {
-//                        os << repeats << '*' << last << '\n';
-//                    }
-//                    last = val;
-//                    repeats = 1;
-//                }
-//            }
-//            if (repeats == 1) {
-//                os << last << '\n';
-//            } else if (repeats > 1) {
-//                os << repeats << '*' << last << '\n';
-//            }
-//            os << "/\n\n";
-//        }
 
 
         template <typename T>
@@ -401,16 +430,16 @@ namespace Opm
 
         void filterDoubleField(const std::string& keyword, std::vector<double>& output_field)
         {
-            if (parser_.hasField(keyword)) {
-                const std::vector<double>& field = parser_.getFloatingPointValue(keyword);
+            if (deck_->hasKeyword(keyword)) {
+                const std::vector<double>& field = deck_->getKeyword(keyword)->getRawDoubleData();
                 filterField(field, output_field);
             }
         }
 
         void filterIntegerField(const std::string& keyword, std::vector<int>& output_field)
         {
-            if (parser_.hasField(keyword)) {
-                const std::vector<int>& field = parser_.getIntegerValue(keyword);
+            if (deck_->hasKeyword(keyword)) {
+                const std::vector<int>& field = deck_->getKeyword(keyword)->getIntData();
                 filterField(field, output_field);
             }
         }

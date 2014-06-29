@@ -21,7 +21,6 @@
 #include <opm/core/simulator/SimulatorTimer.hpp>
 #include <opm/core/utility/parameters/ParameterGroup.hpp>
 #include <opm/core/utility/Units.hpp>
-#include <opm/core/io/eclipse/EclipseGridParser.hpp>
 #include <ostream>
 #include <numeric>
 
@@ -49,12 +48,17 @@ namespace Opm
         total_time_ = num_psteps*stepsize;
     }
 
-    /// Initialize from TSTEP field.
-    void SimulatorTimer::init(const EclipseGridParser& deck)
+    /// Use the SimulatorTimer as a shim around opm-parser's Opm::TimeMap
+    void SimulatorTimer::init(Opm::TimeMapConstPtr timeMap)
     {
-        timesteps_  = deck.getTSTEP().tstep_;
-        total_time_ = std::accumulate(timesteps_.begin(), timesteps_.end(), 0.0);
-        start_date_ = deck.getStartDate();
+        current_step_ = 0;
+        total_time_ = timeMap->getTotalTime();
+        timesteps_.resize(timeMap->numTimesteps());
+        for ( size_t i = 0; i < timeMap->numTimesteps(); ++i ) {
+            timesteps_[i] = timeMap->getTimeStepLength(i);
+        }
+        boost::posix_time::ptime start_time = timeMap->getStartTime(0);
+        start_date_ = start_time.date();
     }
 
     /// Total number of steps.
@@ -72,11 +76,6 @@ namespace Opm
     /// Set current step number.
     void SimulatorTimer::setCurrentStepNum(int step)
     {
-        if (current_step_ < 0 || current_step_ > int(timesteps_.size())) {
-            // Note that we do allow current_step_ == timesteps_.size(),
-            // that is the done() state.
-            OPM_THROW(std::runtime_error, "Trying to set invalid step number: " << step);
-        }
         current_step_ = step;
         current_time_ = std::accumulate(timesteps_.begin(), timesteps_.begin() + step, 0.0);
     }
@@ -89,16 +88,28 @@ namespace Opm
         return timesteps_[current_step_];
     }
 
-    /// Current time.
-    double SimulatorTimer::currentTime() const
+    double SimulatorTimer::stepLengthTaken() const
+    {
+        assert(current_step_ > 0);
+        return timesteps_[current_step_ - 1];
+    }
+
+    /// time elapsed since the start of the simulation [s].
+    double SimulatorTimer::simulationTimeElapsed() const
     {
         return current_time_;
     }
 
+    /// time elapsed since the start of the POSIX epoch (Jan 1st, 1970) [s].
+    time_t SimulatorTimer::currentPosixTime() const
+    {
+        tm t = boost::posix_time::to_tm(currentDateTime());
+        return std::mktime(&t);
+    }
 
     boost::posix_time::ptime SimulatorTimer::currentDateTime() const
     {
-      return boost::posix_time::ptime(start_date_) + boost::posix_time::seconds( (int) current_time_ );
+        return boost::posix_time::ptime(start_date_) + boost::posix_time::seconds( (int) current_time_ );
     }
 
 
@@ -122,7 +133,7 @@ namespace Opm
     void SimulatorTimer::report(std::ostream& os) const
     {
         os << "\n\n---------------    Simulation step number " << currentStepNum() << "    ---------------"
-           << "\n      Current time (days)     " << Opm::unit::convert::to(currentTime(), Opm::unit::day)
+           << "\n      Current time (days)     " << Opm::unit::convert::to(simulationTimeElapsed(), Opm::unit::day)
            << "\n      Current stepsize (days) " << Opm::unit::convert::to(currentStepLength(), Opm::unit::day)
            << "\n      Total time (days)       " << Opm::unit::convert::to(totalTime(), Opm::unit::day)
            << "\n" << std::endl;

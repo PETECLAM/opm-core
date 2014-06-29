@@ -25,8 +25,10 @@
 #include <opm/core/props/rock/RockFromDeck.hpp>
 #include <opm/core/props/pvt/BlackoilPvtProperties.hpp>
 #include <opm/core/props/satfunc/SaturationPropsFromDeck.hpp>
-#include <opm/core/io/eclipse/EclipseGridParser.hpp>
 #include <opm/core/utility/parameters/ParameterGroup.hpp>
+
+#include <opm/parser/eclipse/Deck/Deck.hpp>
+
 #include <memory>
 
 struct UnstructuredGrid;
@@ -44,7 +46,8 @@ namespace Opm
         /// \param[in]  grid     Grid to which property object applies, needed for the
         ///                      mapping from cell indices (typically from a processed grid)
         ///                      to logical cartesian indices consistent with the deck.
-        BlackoilPropertiesFromDeck(const EclipseGridParser& deck,
+        BlackoilPropertiesFromDeck(Opm::DeckConstPtr deck,
+                                   Opm::EclipseStateConstPtr eclState,
                                    const UnstructuredGrid& grid, bool init_rock=true );
 
         /// Initialize from deck, grid and parameters.
@@ -58,8 +61,31 @@ namespace Opm
         ///                        threephase_model("simple")  three-phase relperm model (accepts "simple" and "stone2").
         ///                      For both size parameters, a 0 or negative value indicates that no spline fitting is to
         ///                      be done, and the input fluid data used directly for linear interpolation.
-        BlackoilPropertiesFromDeck(const EclipseGridParser& deck,
+        BlackoilPropertiesFromDeck(Opm::DeckConstPtr deck,
+                                   Opm::EclipseStateConstPtr eclState,
                                    const UnstructuredGrid& grid,
+                                   const parameter::ParameterGroup& param,
+                                   bool init_rock=true);
+
+
+        template<class CentroidIterator>
+        BlackoilPropertiesFromDeck(Opm::DeckConstPtr  deck,
+                                   Opm::EclipseStateConstPtr eclState,
+                                   int number_of_cells,
+                                   const int* global_cell,
+                                   const int* cart_dims,
+                                   const CentroidIterator& begin_cell_centroids,
+                                   int dimension,
+                                   bool init_rock=true);
+
+        template<class CentroidIterator>
+        BlackoilPropertiesFromDeck(Opm::DeckConstPtr  deck,
+                                   Opm::EclipseStateConstPtr eclState,
+                                   int number_of_cells,
+                                   const int* global_cell,
+                                   const int* cart_dims,
+                                   const CentroidIterator& begin_cell_centroids,
+                                   int dimension,
                                    const parameter::ParameterGroup& param,
                                    bool init_rock=true);
 
@@ -74,6 +100,11 @@ namespace Opm
 
         /// \return   N, the number of cells.
         virtual int numCells() const;
+
+        /// Return an array containing the PVT table index for each
+        /// grid cell
+        virtual const int* cellPvtRegionIndex() const
+        { return &cellPvtRegionIdx_[0]; }
 
         /// \return   Array of N porosity values.
         virtual const double* porosity() const;
@@ -130,14 +161,16 @@ namespace Opm
         ///                    matrix A = RB^{-1} which relates z to u by z = Au. The matrices
         ///                    are assumed to be in Fortran order, and are typically the result
         ///                    of a call to the method matrix().
+        /// \param[in]  cells  The index of the grid cell of each data point.
         /// \param[out] rho    Array of nP density values, array must be valid before calling.
         virtual void density(const int n,
                              const double* A,
+                             const int* cells,
                              double* rho) const;
 
         /// Densities of stock components at surface conditions.
         /// \return Array of P density values.
-        virtual const double* surfaceDensity() const;
+        virtual const double* surfaceDensity(int cellIdx = 0) const;
 
         /// \param[in]  n      Number of data points.
         /// \param[in]  s      Array of nP saturation values.
@@ -184,7 +217,34 @@ namespace Opm
                               double* smax) const;
 
     private:
+        int getTableIndex_(const int* pvtTableIdx, int cellIdx) const
+        {
+            if (!pvtTableIdx)
+                return 0;
+            return pvtTableIdx[cellIdx];
+        }
+
+        template<class CentroidIterator>
+        void init(Opm::DeckConstPtr deck,
+                  Opm::EclipseStateConstPtr eclState,
+                  int number_of_cells,
+                  const int* global_cell,
+                  const int* cart_dims,
+                  const CentroidIterator& begin_cell_centroids,
+                  int dimension,
+                  bool init_rock);
+        template<class CentroidIterator>
+        void init(Opm::DeckConstPtr deck,
+                  Opm::EclipseStateConstPtr eclState,
+                  int number_of_cells,
+                  const int* global_cell,
+                  const int* cart_dims,
+                  const CentroidIterator& begin_cell_centroids,
+                  int dimension,
+                  const parameter::ParameterGroup& param,
+                  bool init_rock);
         RockFromDeck rock_;
+        std::vector<int> cellPvtRegionIdx_;
         BlackoilPvtProperties pvt_;
         std::unique_ptr<SaturationPropsInterface> satprops_;
         mutable std::vector<double> B_;
@@ -197,5 +257,6 @@ namespace Opm
 
 } // namespace Opm
 
+#include "BlackoilPropertiesFromDeck_impl.hpp"
 
 #endif // OPM_BLACKOILPROPERTIESFROMDECK_HEADER_INCLUDED

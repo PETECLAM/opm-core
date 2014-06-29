@@ -23,88 +23,23 @@
 
 namespace Opm
 {
-
-    BlackoilPropertiesFromDeck::BlackoilPropertiesFromDeck(const EclipseGridParser& deck,
+    BlackoilPropertiesFromDeck::BlackoilPropertiesFromDeck(Opm::DeckConstPtr deck,
+                                                           Opm::EclipseStateConstPtr eclState,
                                                            const UnstructuredGrid& grid,
                                                            bool init_rock)
     {
-       if (init_rock){
-            rock_.init(deck, grid);
-        }
-        pvt_.init(deck, 200);
-        SaturationPropsFromDeck<SatFuncSimpleUniform>* ptr
-            = new SaturationPropsFromDeck<SatFuncSimpleUniform>();
-        satprops_.reset(ptr);
-        ptr->init(deck, grid, 200);
-
-        if (pvt_.numPhases() != satprops_->numPhases()) {
-            OPM_THROW(std::runtime_error, "BlackoilPropertiesFromDeck::BlackoilPropertiesFromDeck() - Inconsistent number of phases in pvt data ("
-                  << pvt_.numPhases() << ") and saturation-dependent function data (" << satprops_->numPhases() << ").");
-        }
+        init(deck, eclState, grid.number_of_cells, grid.global_cell, grid.cartdims,
+             grid.cell_centroids, grid.dimensions, init_rock);
     }
 
-    BlackoilPropertiesFromDeck::BlackoilPropertiesFromDeck(const EclipseGridParser& deck,
+    BlackoilPropertiesFromDeck::BlackoilPropertiesFromDeck(Opm::DeckConstPtr deck,
+                                                           Opm::EclipseStateConstPtr eclState,
                                                            const UnstructuredGrid& grid,
                                                            const parameter::ParameterGroup& param,
                                                            bool init_rock)
     {
-        if(init_rock){
-            rock_.init(deck, grid);
-        }
-
-        const int pvt_samples = param.getDefault("pvt_tab_size", 200);
-        pvt_.init(deck, pvt_samples);
-
-        // Unfortunate lack of pointer smartness here...
-        const int sat_samples = param.getDefault("sat_tab_size", 200);
-        std::string threephase_model = param.getDefault<std::string>("threephase_model", "simple");
-        if (deck.hasField("ENDSCALE") && threephase_model != "simple") {
-            OPM_THROW(std::runtime_error, "Sorry, end point scaling currently available for the 'simple' model only.");
-        }
-        if (sat_samples > 1) {
-            if (threephase_model == "stone2") {
-                SaturationPropsFromDeck<SatFuncStone2Uniform>* ptr
-                    = new SaturationPropsFromDeck<SatFuncStone2Uniform>();
-                satprops_.reset(ptr);
-                ptr->init(deck, grid, sat_samples);
-            } else if (threephase_model == "simple") {
-                SaturationPropsFromDeck<SatFuncSimpleUniform>* ptr
-                    = new SaturationPropsFromDeck<SatFuncSimpleUniform>();
-                satprops_.reset(ptr);
-                ptr->init(deck, grid, sat_samples);
-            } else if (threephase_model == "gwseg") {
-                SaturationPropsFromDeck<SatFuncGwsegUniform>* ptr
-                    = new SaturationPropsFromDeck<SatFuncGwsegUniform>();
-                satprops_.reset(ptr);
-                ptr->init(deck, grid, sat_samples);
-            } else {
-                OPM_THROW(std::runtime_error, "Unknown threephase_model: " << threephase_model);
-            }
-        } else {
-            if (threephase_model == "stone2") {
-                SaturationPropsFromDeck<SatFuncStone2Nonuniform>* ptr
-                    = new SaturationPropsFromDeck<SatFuncStone2Nonuniform>();
-                satprops_.reset(ptr);
-                ptr->init(deck, grid, sat_samples);
-            } else if (threephase_model == "simple") {
-                SaturationPropsFromDeck<SatFuncSimpleNonuniform>* ptr
-                    = new SaturationPropsFromDeck<SatFuncSimpleNonuniform>();
-                satprops_.reset(ptr);
-                ptr->init(deck, grid, sat_samples);
-            } else if (threephase_model == "gwseg") {
-                SaturationPropsFromDeck<SatFuncGwsegNonuniform>* ptr
-                    = new SaturationPropsFromDeck<SatFuncGwsegNonuniform>();
-                satprops_.reset(ptr);
-                ptr->init(deck, grid, sat_samples);
-            } else {
-                OPM_THROW(std::runtime_error, "Unknown threephase_model: " << threephase_model);
-            }
-        }
-
-        if (pvt_.numPhases() != satprops_->numPhases()) {
-            OPM_THROW(std::runtime_error, "BlackoilPropertiesFromDeck::BlackoilPropertiesFromDeck() - Inconsistent number of phases in pvt data ("
-                  << pvt_.numPhases() << ") and saturation-dependent function data (" << satprops_->numPhases() << ").");
-        }
+        init(deck, eclState, grid.number_of_cells, grid.global_cell, grid.cartdims, grid.cell_centroids, 
+             grid.dimensions, param, init_rock);
     }
 
     BlackoilPropertiesFromDeck::~BlackoilPropertiesFromDeck()
@@ -163,14 +98,20 @@ namespace Opm
     void BlackoilPropertiesFromDeck::viscosity(const int n,
                                                const double* p,
                                                const double* z,
-                                               const int* /*cells*/,
+                                               const int* cells,
                                                double* mu,
                                                double* dmudp) const
     {
         if (dmudp) {
             OPM_THROW(std::runtime_error, "BlackoilPropertiesFromDeck::viscosity()  --  derivatives of viscosity not yet implemented.");
         } else {
-            pvt_.mu(n, p, z, mu);
+            const int *cellPvtTableIdx = cellPvtRegionIndex();
+            assert(cellPvtTableIdx != 0);
+            std::vector<int> pvtTableIdx(n);
+            for (int i = 0; i < n; ++ i)
+                pvtTableIdx[i] = cellPvtTableIdx[cells[i]];
+
+            pvt_.mu(n, &pvtTableIdx[0], p, z, mu);
         }
     }
 
@@ -187,21 +128,27 @@ namespace Opm
     void BlackoilPropertiesFromDeck::matrix(const int n,
                                             const double* p,
                                             const double* z,
-                                            const int* /*cells*/,
+                                            const int* cells,
                                             double* A,
                                             double* dAdp) const
     {
         const int np = numPhases();
+
+        const int *cellPvtTableIdx = cellPvtRegionIndex();
+        std::vector<int> pvtTableIdx(n);
+        for (int i = 0; i < n; ++ i)
+            pvtTableIdx[i] = cellPvtTableIdx[cells[i]];
+
         B_.resize(n*np);
         R_.resize(n*np);
         if (dAdp) {
             dB_.resize(n*np);
             dR_.resize(n*np);
-            pvt_.dBdp(n, p, z, &B_[0], &dB_[0]);
-            pvt_.dRdp(n, p, z, &R_[0], &dR_[0]);
+            pvt_.dBdp(n, &pvtTableIdx[0], p, z, &B_[0], &dB_[0]);
+            pvt_.dRdp(n, &pvtTableIdx[0], p, z, &R_[0], &dR_[0]);
         } else {
-            pvt_.B(n, p, z, &B_[0]);
-            pvt_.R(n, p, z, &R_[0]);
+            pvt_.B(n, &pvtTableIdx[0], p, z, &B_[0]);
+            pvt_.R(n, &pvtTableIdx[0], p, z, &R_[0]);
         }
         const int* phase_pos = pvt_.phasePosition();
         bool oil_and_gas = pvt_.phaseUsed()[BlackoilPhases::Liquid] &&
@@ -274,15 +221,19 @@ namespace Opm
     ///                    matrix A = RB^{-1} which relates z to u by z = Au. The matrices
     ///                    are assumed to be in Fortran order, and are typically the result
     ///                    of a call to the method matrix().
+    /// \param[in]  cells  The index of the grid cell of each data point.
     /// \param[out] rho    Array of nP density values, array must be valid before calling.
     void BlackoilPropertiesFromDeck::density(const int n,
                                              const double* A,
+                                             const int* cells,
                                              double* rho) const
     {
         const int np = numPhases();
-        const double* sdens = pvt_.surfaceDensities();
 // #pragma omp parallel for
         for (int i = 0; i < n; ++i) {
+            int cellIdx = cells?cells[i]:i;
+            int pvtRegionIdx = getTableIndex_(cellPvtRegionIndex(), cellIdx);
+            const double* sdens = pvt_.surfaceDensities(pvtRegionIdx);
             for (int phase = 0; phase < np; ++phase) {
                 rho[np*i + phase] = 0.0;
                 for (int comp = 0; comp < np; ++comp) {
@@ -294,9 +245,10 @@ namespace Opm
 
     /// Densities of stock components at surface conditions.
     /// \return Array of P density values.
-    const double* BlackoilPropertiesFromDeck::surfaceDensity() const
+    const double* BlackoilPropertiesFromDeck::surfaceDensity(int cellIdx) const
     {
-        return pvt_.surfaceDensities();
+        int pvtRegionIdx = getTableIndex_(cellPvtRegionIndex(), cellIdx);
+        return pvt_.surfaceDensities(pvtRegionIdx);
     }
 
     /// \param[in]  n      Number of data points.

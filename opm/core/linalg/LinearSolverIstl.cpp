@@ -23,25 +23,39 @@
 #endif
 
 #include <opm/core/linalg/LinearSolverIstl.hpp>
+#include <opm/core/linalg/ParallelIstlInformation.hpp>
+#include <opm/core/utility/ErrorMacros.hpp>
 
 // Silence compatibility warning from DUNE headers since we don't use
 // the deprecated member anyway (in this compilation unit)
 #define DUNE_COMMON_FIELDVECTOR_SIZE_IS_METHOD 1
 
+#include "disable_warning_pragmas.h"
+
 // TODO: clean up includes.
 #include <dune/common/deprecated.hh>
+#include <dune/common/version.hh>
 #include <dune/istl/bvector.hh>
 #include <dune/istl/bcrsmatrix.hh>
 #include <dune/istl/operators.hh>
 #include <dune/istl/io.hh>
+#include <dune/istl/owneroverlapcopy.hh>
 #include <dune/istl/preconditioners.hh>
+#include <dune/istl/schwarz.hh>
 #include <dune/istl/solvers.hh>
 #include <dune/istl/paamg/amg.hh>
 #include <dune/istl/paamg/kamg.hh>
+#include <dune/istl/paamg/pinfo.hh>
+
+#if DUNE_VERSION_NEWER(DUNE_ISTL, 2, 3)
+#include <dune/istl/paamg/fastamg.hh>
+#endif
+
+#include "reenable_warning_pragmas.h"
 
 #include <stdexcept>
 #include <iostream>
-
+#include <type_traits>
 
 namespace Opm
 {
@@ -54,25 +68,30 @@ namespace Opm
         typedef Dune::BlockVector<VectorBlockType>        Vector;
         typedef Dune::MatrixAdapter<Mat,Vector,Vector> Operator;
 
+        template<class O, class S, class C>
         LinearSolverInterface::LinearSolverReport
-        solveCG_ILU0(const Mat& A, Vector& x, Vector& b, double tolerance, int maxit, int verbosity);
+        solveCG_ILU0(O& A, Vector& x, Vector& b, S& sp, const C& comm, double tolerance, int maxit, int verbosity);
 
+        template<class O, class S, class C>
         LinearSolverInterface::LinearSolverReport
-        solveCG_AMG(const Mat& A, Vector& x, Vector& b, double tolerance, int maxit, int verbosity,
+        solveCG_AMG(O& A, Vector& x, Vector& b, S& sp, const C& comm, double tolerance, int maxit, int verbosity,
                     double prolongateFactor, int smoothsteps);
 
-#ifdef HAS_DUNE_FAST_AMG
+#if defined(HAS_DUNE_FAST_AMG) || DUNE_VERSION_NEWER(DUNE_ISTL, 2, 3)
+       template<class O, class S, class C>
         LinearSolverInterface::LinearSolverReport
-        solveKAMG(const Mat& A, Vector& x, Vector& b, double tolerance, int maxit, int verbosity,
+        solveKAMG(O& A, Vector& x, Vector& b, S& sp, const C& comm, double tolerance, int maxit, int verbosity,
                   double prolongateFactor, int smoothsteps);
 
+       template<class O, class S, class C>
         LinearSolverInterface::LinearSolverReport
-        solveFastAMG(const Mat& A, Vector& x, Vector& b, double tolerance, int maxit, int verbosity,
+        solveFastAMG(O& A, Vector& x, Vector& b, S& sp, const C& comm, double tolerance, int maxit, int verbosity,
                      double prolongateFactor);
 #endif
 
+        template<class O, class S, class C>
         LinearSolverInterface::LinearSolverReport
-        solveBiCGStab_ILU0(const Mat& A, Vector& x, Vector& b, double tolerance, int maxit, int verbosity);
+        solveBiCGStab_ILU0(O& A, Vector& x, Vector& b, S& sp, const C& comm, double tolerance, int maxit, int verbosity);
     } // anonymous namespace
 
 
@@ -123,7 +142,8 @@ namespace Opm
                             const int* ja,
                             const double* sa,
                             const double* rhs,
-                            double* solution) const
+                            double* solution,
+                            const boost::any& comm) const
     {
         // Build Istl structures from input.
         // System matrix
@@ -139,17 +159,50 @@ namespace Opm
                 A[ri][ja[i]] = sa[i];
             }
         }
-        // System RHS
-        Vector b(size);
-        std::copy(rhs, rhs + size, b.begin());
+
+        int maxit = linsolver_max_iterations_;
+        if (maxit == 0) {
+            maxit = 5000;
+        }
+#if HAVE_MPI
+        if(comm.type()==typeid(ParallelISTLInformation))
+        {
+            typedef Dune::OwnerOverlapCopyCommunication<int,int> Comm;
+            const ParallelISTLInformation& info = boost::any_cast<const ParallelISTLInformation&>(comm);
+            Comm istlComm(info.communicator());
+            info.copyValuesTo(istlComm.indexSet(), istlComm.remoteIndices());
+            Dune::OverlappingSchwarzOperator<Mat,Vector,Vector, Comm>
+                opA(A, istlComm);
+            Dune::OverlappingSchwarzScalarProduct<Vector,Comm> sp(istlComm);
+            return solveSystem(opA, solution, rhs, sp, istlComm, maxit);
+        }
+        else
+#endif
+        {
+            (void) comm; // Avoid warning for unused argument if no MPI.
+            Dune::SeqScalarProduct<Vector> sp;
+            Dune::Amg::SequentialInformation seq_comm;
+            Operator opA(A);
+            return solveSystem(opA, solution, rhs, sp, seq_comm, maxit);
+        }
+    }
+
+    template<class O, class S, class C>
+    LinearSolverInterface::LinearSolverReport
+    LinearSolverIstl::solveSystem (O& opA, double* solution, const double* rhs,
+                                   S& sp, const C& comm, int maxit) const
+    {
+                // System RHS
+        Vector b(opA.getmat().N());
+        std::copy(rhs, rhs+b.size(), b.begin());
         // System solution
-        Vector x(size);
+        Vector x(opA.getmat().M());
         x = 0.0;
 
         if (linsolver_save_system_)
         {
             // Save system to files.
-            writeMatrixToMatlab(A, linsolver_save_filename_ + "-mat");
+            writeMatrixToMatlab(opA.getmat(), linsolver_save_filename_ + "-mat");
             std::string rhsfile(linsolver_save_filename_ + "-rhs");
             std::ofstream rhsf(rhsfile.c_str());
             rhsf.precision(15);
@@ -158,41 +211,44 @@ namespace Opm
                       std::ostream_iterator<VectorBlockType>(rhsf, "\n"));
         }
 
-        int maxit = linsolver_max_iterations_;
-        if (maxit == 0) {
-            maxit = 5000;
-        }
-
         LinearSolverReport res;
         switch (linsolver_type_) {
         case CG_ILU0:
-            res = solveCG_ILU0(A, x, b, linsolver_residual_tolerance_, maxit, linsolver_verbosity_);
+            res = solveCG_ILU0(opA, x, b, sp, comm, linsolver_residual_tolerance_, maxit, linsolver_verbosity_);
             break;
         case CG_AMG:
-            res = solveCG_AMG(A, x, b, linsolver_residual_tolerance_, maxit, linsolver_verbosity_,
+            res = solveCG_AMG(opA, x, b, sp, comm, linsolver_residual_tolerance_, maxit, linsolver_verbosity_,
                               linsolver_prolongate_factor_, linsolver_smooth_steps_);
             break;
         case KAMG:
-#ifdef HAS_DUNE_FAST_AMG
-            res = solveKAMG(A, x, b, linsolver_residual_tolerance_, maxit, linsolver_verbosity_,
+#if defined(HAS_DUNE_FAST_AMG) || DUNE_VERSION_NEWER(DUNE_ISTL, 2, 3)
+            res = solveKAMG(opA, x, b, sp, comm, linsolver_residual_tolerance_, maxit, linsolver_verbosity_,
                             linsolver_prolongate_factor_, linsolver_smooth_steps_);
 #else
             throw std::runtime_error("KAMG not supported with this version of DUNE");
 #endif
             break;
         case FastAMG:
-#ifdef HAS_DUNE_FAST_AMG
-            res = solveFastAMG(A, x, b, linsolver_residual_tolerance_, maxit, linsolver_verbosity_,
+#if defined(HAS_DUNE_FAST_AMG) || DUNE_VERSION_NEWER(DUNE_ISTL, 2, 3)
+
+#if HAVE_MPI
+            if(std::is_same<C,Dune::OwnerOverlapCopyCommunication<int,int> >::value)
+            {
+                OPM_THROW(std::runtime_error, "Trying to use sequential FastAMG solver for a parallel problem!");
+            }
+#endif // HAVE_MPI
+
+            res = solveFastAMG(opA, x, b, sp, comm, linsolver_residual_tolerance_, maxit, linsolver_verbosity_,
                                linsolver_prolongate_factor_);
 #else
             if(linsolver_verbosity_)
               std::cerr<<"Fast AMG is not available; falling back to CG preconditioned with the normal one"<<std::endl;
-            res = solveCG_AMG(A, x, b, linsolver_residual_tolerance_, maxit, linsolver_verbosity_,
+            res = solveCG_AMG(opA, x, b, sp, comm, linsolver_residual_tolerance_, maxit, linsolver_verbosity_,
                                linsolver_prolongate_factor_, linsolver_smooth_steps_);
 #endif
             break;
         case BiCGStab_ILU0:
-            res = solveBiCGStab_ILU0(A, x, b, linsolver_residual_tolerance_, maxit, linsolver_verbosity_);
+            res = solveBiCGStab_ILU0(opA, x, b, sp, comm, linsolver_residual_tolerance_, maxit, linsolver_verbosity_);
             break;
         default:
             std::cerr << "Unknown linsolver_type: " << int(linsolver_type_) << '\n';
@@ -212,21 +268,60 @@ namespace Opm
         return linsolver_residual_tolerance_;
     }
 
-
-
     namespace
     {
-
-    LinearSolverInterface::LinearSolverReport
-    solveCG_ILU0(const Mat& A, Vector& x, Vector& b, double tolerance, int maxit, int verbosity)
+    template<class P, class O, class C>
+    struct SmootherChooser
     {
-        Operator opA(A);
+        typedef P Type;
+    };
+
+#if HAVE_MPI
+    template<class P, class O>
+    struct SmootherChooser<P, O, Dune::OwnerOverlapCopyCommunication<int,int> >
+    {
+        typedef Dune::OwnerOverlapCopyCommunication<int,int> Comm;
+        typedef Dune::BlockPreconditioner<typename O::domain_type, typename O::range_type,
+                                          Comm, P>
+        Type;
+    };
+#endif
+
+
+    template<class P, class O, class C>
+    struct PreconditionerTraits
+    {
+        typedef typename SmootherChooser<P,O,C>::Type SmootherType;
+        typedef std::shared_ptr<SmootherType> PointerType;
+    };
+
+    template<class P, class O, class C>
+    typename PreconditionerTraits<P,O,C>::PointerType
+    makePreconditioner(O& opA, double relax, const C& comm, int iterations=1)
+    {
+        typedef typename SmootherChooser<P,O,C>::Type SmootherType;
+        typedef typename PreconditionerTraits<P,O,C>::PointerType PointerType;
+        typename Dune::Amg::SmootherTraits<SmootherType>::Arguments args;
+        typename Dune::Amg::ConstructionTraits<SmootherType>::Arguments cargs;
+        cargs.setMatrix(opA.getmat());
+        args.iterations=iterations;
+        args.relaxationFactor=relax;
+        cargs.setArgs(args);
+        cargs.setComm(comm);
+        return PointerType(Dune::Amg::ConstructionTraits<SmootherType>::construct(cargs));
+    }
+
+    template<class O, class S, class C>
+    LinearSolverInterface::LinearSolverReport
+    solveCG_ILU0(O& opA, Vector& x, Vector& b, S& sp, const C& comm, double tolerance, int maxit, int verbosity)
+    {
 
         // Construct preconditioner.
-        Dune::SeqILU0<Mat,Vector,Vector> precond(A, 1.0);
+        typedef Dune::SeqILU0<Mat,Vector,Vector> Preconditioner;
+        auto precond = makePreconditioner<Preconditioner>(opA, 1.0, comm);
 
         // Construct linear solver.
-        Dune::CGSolver<Vector> linsolve(opA, precond, tolerance, maxit, verbosity);
+        Dune::CGSolver<Vector> linsolve(opA, sp, *precond, tolerance, maxit, verbosity);
 
         // Solve system.
         Dune::InverseOperatorResult result;
@@ -261,8 +356,9 @@ namespace Opm
         criterion.setGamma(1); // V-cycle; this is the default
     }
 
+    template<class O, class S, class C>
     LinearSolverInterface::LinearSolverReport
-    solveCG_AMG(const Mat& A, Vector& x, Vector& b, double tolerance, int maxit, int verbosity,
+    solveCG_AMG(O& opA, Vector& x, Vector& b, S& sp, const C& comm, double tolerance, int maxit, int verbosity,
                 double linsolver_prolongate_factor, int linsolver_smooth_steps)
     {
         // Solve with AMG solver.
@@ -280,23 +376,23 @@ namespace Opm
 #endif
 
 #if SMOOTHER_ILU
-        typedef Dune::SeqILU0<Mat,Vector,Vector>        Smoother;
+        typedef Dune::SeqILU0<Mat,Vector,Vector>        SeqSmoother;
 #else
-        typedef Dune::SeqSOR<Mat,Vector,Vector>        Smoother;
+        typedef Dune::SeqSOR<Mat,Vector,Vector>        SeqSmoother;
 #endif
+        typedef typename SmootherChooser<SeqSmoother, O, C>::Type Smoother;
         typedef Dune::Amg::CoarsenCriterion<CriterionBase> Criterion;
-        typedef Dune::Amg::AMG<Operator,Vector,Smoother>   Precond;
+        typedef Dune::Amg::AMG<O,Vector,Smoother,C>   Precond;
 
         // Construct preconditioner.
         Criterion criterion;
-        Precond::SmootherArgs smootherArgs;
-        Operator opA(A);
+        typename Precond::SmootherArgs smootherArgs;
         setUpCriterion(criterion, linsolver_prolongate_factor, verbosity,
                        linsolver_smooth_steps);
-        Precond precond(opA, criterion, smootherArgs);
+        Precond precond(opA, criterion, smootherArgs, comm);
 
         // Construct linear solver.
-        Dune::CGSolver<Vector> linsolve(opA, precond, tolerance, maxit, verbosity);
+        Dune::CGSolver<Vector> linsolve(opA, sp, precond, tolerance, maxit, verbosity);
 
         // Solve system.
         Dune::InverseOperatorResult result;
@@ -311,12 +407,14 @@ namespace Opm
     }
 
 
-#ifdef HAS_DUNE_FAST_AMG
+#if defined(HAS_DUNE_FAST_AMG) || DUNE_VERSION_NEWER(DUNE_ISTL, 2, 3)
+    template<class O, class S, class C>
     LinearSolverInterface::LinearSolverReport
-    solveKAMG(const Mat& A, Vector& x, Vector& b, double tolerance, int maxit, int verbosity,
+    solveKAMG(O& opA, Vector& x, Vector& b, S& /* sp */, const C& /* comm */, double tolerance, int maxit, int verbosity,
               double linsolver_prolongate_factor, int linsolver_smooth_steps)
     {
         // Solve with AMG solver.
+        Dune::MatrixAdapter<typename O::matrix_type,Vector,Vector> sOpA(opA.getmat());
 
 #if FIRST_DIAGONAL
         typedef Dune::Amg::FirstDiagonal CouplingMetric;
@@ -339,15 +437,14 @@ namespace Opm
         typedef Dune::Amg::KAMG<Operator,Vector,Smoother,Dune::Amg::SequentialInformation>   Precond;
 
         // Construct preconditioner.
-        Operator opA(A);
         Precond::SmootherArgs smootherArgs;
         Criterion criterion;
         setUpCriterion(criterion, linsolver_prolongate_factor, verbosity,
                        linsolver_smooth_steps);
-        Precond precond(opA, criterion, smootherArgs);
+        Precond precond(sOpA, criterion, smootherArgs);
 
         // Construct linear solver.
-        Dune::GeneralizedPCGSolver<Vector> linsolve(opA, precond, tolerance, maxit, verbosity);
+        Dune::GeneralizedPCGSolver<Vector> linsolve(sOpA, precond, tolerance, maxit, verbosity);
 
         // Solve system.
         Dune::InverseOperatorResult result;
@@ -361,11 +458,14 @@ namespace Opm
         return res;
     }
 
+    template<class O, class S, class C>
     LinearSolverInterface::LinearSolverReport
-    solveFastAMG(const Mat& A, Vector& x, Vector& b, double tolerance, int maxit, int verbosity,
+    solveFastAMG(O& opA, Vector& x, Vector& b, S& /* sp */, const C& /* comm */, double tolerance, int maxit, int verbosity,
                  double linsolver_prolongate_factor)
     {
         // Solve with AMG solver.
+        typedef Dune::MatrixAdapter<typename O::matrix_type, Vector, Vector> Operator;
+        Operator sOpA(opA.getmat());
 
 #if FIRST_DIAGONAL
         typedef Dune::Amg::FirstDiagonal CouplingMetric;
@@ -383,7 +483,6 @@ namespace Opm
         typedef Dune::Amg::FastAMG<Operator,Vector>   Precond;
 
         // Construct preconditioner.
-        Operator opA(A);
         Criterion criterion;
         const int smooth_steps = 1;
         setUpCriterion(criterion, linsolver_prolongate_factor, verbosity, smooth_steps);
@@ -392,10 +491,10 @@ namespace Opm
         parms.setNoPreSmoothSteps(smooth_steps);
         parms.setNoPostSmoothSteps(smooth_steps);
         parms.setProlongationDampingFactor(linsolver_prolongate_factor);
-        Precond precond(opA, criterion, parms);
+        Precond precond(sOpA, criterion, parms);
 
         // Construct linear solver.
-        Dune::GeneralizedPCGSolver<Vector> linsolve(opA, precond, tolerance, maxit, verbosity);
+        Dune::GeneralizedPCGSolver<Vector> linsolve(sOpA, precond, tolerance, maxit, verbosity);
 
         // Solve system.
         Dune::InverseOperatorResult result;
@@ -410,17 +509,17 @@ namespace Opm
     }
 #endif
 
-
+    template<class O, class S, class C>
     LinearSolverInterface::LinearSolverReport
-    solveBiCGStab_ILU0(const Mat& A, Vector& x, Vector& b, double tolerance, int maxit, int verbosity)
+    solveBiCGStab_ILU0(O& opA, Vector& x, Vector& b, S& sp, const C& comm, double tolerance, int maxit, int verbosity)
     {
-        Operator opA(A);
 
         // Construct preconditioner.
-        Dune::SeqILU0<Mat,Vector,Vector> precond(A, 1.0);
+        typedef Dune::SeqILU0<Mat,Vector,Vector> Preconditioner;
+        auto precond = makePreconditioner<Preconditioner>(opA, 1.0, comm);
 
         // Construct linear solver.
-        Dune::BiCGSTABSolver<Vector> linsolve(opA, precond, tolerance, maxit, verbosity);
+        Dune::BiCGSTABSolver<Vector> linsolve(opA, sp, *precond, tolerance, maxit, verbosity);
 
         // Solve system.
         Dune::InverseOperatorResult result;

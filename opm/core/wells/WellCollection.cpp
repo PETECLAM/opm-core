@@ -19,52 +19,65 @@
 
 #include "config.h"
 #include <opm/core/wells/WellCollection.hpp>
+
+#include <opm/parser/eclipse/EclipseState/Schedule/Well.hpp>
+#include <opm/parser/eclipse/EclipseState/Schedule/Group.hpp>
+
+#include <boost/lexical_cast.hpp>
+
 #include <memory>
 
 namespace Opm
 {
+    void WellCollection::addField(GroupConstPtr fieldGroup, size_t timeStep, const PhaseUsage& phaseUsage) {
+        WellsGroupInterface* fieldNode = findNode(fieldGroup->name());
+        if (fieldNode) {
+            OPM_THROW(std::runtime_error, "Trying to add FIELD node, but this already exists. Can only have one FIELD node.");
+        }
 
-    void WellCollection::addChild(const std::string& child_name,
-                                  const std::string& parent_name,
-                                  const EclipseGridParser& deck)
-    {
+        roots_.push_back(createGroupWellsGroup(fieldGroup, timeStep, phaseUsage));
+    }
+
+    void WellCollection::addGroup(GroupConstPtr groupChild, std::string parent_name,
+                                  size_t timeStep, const PhaseUsage& phaseUsage) {
         WellsGroupInterface* parent = findNode(parent_name);
         if (!parent) {
-            roots_.push_back(createWellsGroup(parent_name, deck));
-            parent = roots_[roots_.size() - 1].get();
+            OPM_THROW(std::runtime_error, "Trying to add child group to group named " << parent_name << ", but this does not exist in the WellCollection.");
         }
-        std::shared_ptr<WellsGroupInterface> child;
 
-        for (size_t i = 0; i < roots_.size(); ++i) {
-            if (roots_[i]->name() == child_name) {
-                child = roots_[i];
-                // We've found a new parent to the previously thought root, need to remove it
-                for(size_t j = i; j < roots_.size() - 1; ++j) {
-                    roots_[j] = roots_[j+1];
-                }
+        if (findNode(groupChild->name())) {
+            OPM_THROW(std::runtime_error, "Trying to add child group named " << groupChild->name() << ", but this group is already in the WellCollection.");
 
-                roots_.resize(roots_.size()-1);
-                break;
-            }
         }
-        if (!child.get()) {
-            child = createWellsGroup(child_name, deck);
-        }
+
+        std::shared_ptr<WellsGroupInterface> child = createGroupWellsGroup(groupChild, timeStep, phaseUsage);
 
         WellsGroup* parent_as_group = static_cast<WellsGroup*> (parent);
         if (!parent_as_group) {
-            OPM_THROW(std::runtime_error, "Trying to add child to group named " << parent_name << ", but it's not a group.");
+            OPM_THROW(std::runtime_error, "Trying to add child group to group named " << parent->name() << ", but it's not a group.");
         }
         parent_as_group->addChild(child);
-
-        if(child->isLeafNode()) {
-            leaf_nodes_.push_back(static_cast<WellNode*>(child.get()));
-        }
-
         child->setParent(parent);
     }
 
+    void WellCollection::addWell(WellConstPtr wellChild, size_t timeStep, const PhaseUsage& phaseUsage) {
+        WellsGroupInterface* parent = findNode(wellChild->getGroupName(timeStep));
+        if (!parent) {
+            OPM_THROW(std::runtime_error, "Trying to add well " << wellChild->name() << " Step: " << boost::lexical_cast<std::string>(timeStep) << " to group named " << wellChild->getGroupName(timeStep) << ", but this group does not exist in the WellCollection.");
+        }
 
+        std::shared_ptr<WellsGroupInterface> child = createWellWellsGroup(wellChild, timeStep, phaseUsage);
+
+        WellsGroup* parent_as_group = static_cast<WellsGroup*> (parent);
+        if (!parent_as_group) {
+            OPM_THROW(std::runtime_error, "Trying to add well to group named " << wellChild->getGroupName(timeStep) << ", but it's not a group.");
+        }
+        parent_as_group->addChild(child);
+
+        leaf_nodes_.push_back(static_cast<WellNode*>(child.get()));
+
+        child->setParent(parent);
+    }
 
     const std::vector<WellNode*>& WellCollection::getLeafNodes() const {
         return leaf_nodes_;

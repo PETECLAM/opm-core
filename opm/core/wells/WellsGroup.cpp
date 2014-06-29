@@ -1,6 +1,5 @@
 /*
   Copyright 2012 SINTEF ICT, Applied Mathematics.
-
   This file is part of the Open Porous Media project (OPM).
 
   OPM is free software: you can redistribute it and/or modify
@@ -20,6 +19,7 @@
 #include "config.h"
 #include <opm/core/wells/WellsGroup.hpp>
 #include <opm/core/wells.h>
+#include <opm/core/well_controls.h>
 #include <opm/core/props/phaseUsageFromDeck.hpp>
 
 #include <cmath>
@@ -74,7 +74,7 @@ namespace Opm
     {
         return parent_;
     }
-    const std::string& WellsGroupInterface::name()
+    const std::string& WellsGroupInterface::name() const
     {
         return name_;
     }
@@ -655,18 +655,19 @@ namespace Opm
 
         // Check constraints.
         bool is_producer = (wells_->type[self_index_] == PRODUCER);
-        const WellControls& ctrls = *wells_->ctrls[self_index_];
-        for (int ctrl_index = 0; ctrl_index < ctrls.num; ++ctrl_index) {
-            if (ctrl_index == ctrls.current || ctrl_index == group_control_index_) {
+        const WellControls * ctrls = wells_->ctrls[self_index_];
+        for (int ctrl_index = 0; ctrl_index < well_controls_get_num(ctrls); ++ctrl_index) {
+            if (ctrl_index == well_controls_get_current(ctrls) || ctrl_index == group_control_index_) {
                 // We do not check constraints that either were used
                 // as the active control, or that come from group control.
                 continue;
             }
             bool ctrl_violated = false;
-            switch (ctrls.type[ctrl_index]) {
+            switch (well_controls_iget_type(ctrls , ctrl_index)) {
+
             case BHP: {
                 const double my_well_bhp = well_bhp[self_index_];
-                const double my_target_bhp = ctrls.target[ctrl_index];
+                const double my_target_bhp = well_controls_iget_target( ctrls , ctrl_index);
                 ctrl_violated = is_producer ? (my_target_bhp > my_well_bhp)
                     : (my_target_bhp < my_well_bhp);
                 if (ctrl_violated) {
@@ -676,12 +677,14 @@ namespace Opm
                 }
                 break;
             }
+
             case RESERVOIR_RATE: {
                 double my_rate = 0.0;
+                const double * ctrls_distr = well_controls_iget_distr( ctrls , ctrl_index );
                 for (int phase = 0; phase < np; ++phase) {
-                    my_rate += ctrls.distr[np*ctrl_index + phase]*well_reservoirrates_phase[np*self_index_ + phase];
+                    my_rate += ctrls_distr[phase] * well_reservoirrates_phase[np*self_index_ + phase];
                 }
-                const double my_rate_target = ctrls.target[ctrl_index];
+                const double my_rate_target = well_controls_iget_target(ctrls , ctrl_index);
                 ctrl_violated = std::fabs(my_rate) - std::fabs(my_rate_target)> std::max(std::abs(my_rate), std::abs(my_rate_target))*1e-6;
                 if (ctrl_violated) {
                     std::cout << "RESERVOIR_RATE limit violated for well " << name() << ":\n";
@@ -690,12 +693,14 @@ namespace Opm
                 }
                 break;
             }
+
             case SURFACE_RATE: {
                 double my_rate = 0.0;
+                const double * ctrls_distr = well_controls_iget_distr( ctrls , ctrl_index );
                 for (int phase = 0; phase < np; ++phase) {
-                    my_rate += ctrls.distr[np*ctrl_index + phase]*well_surfacerates_phase[np*self_index_ + phase];
+                    my_rate += ctrls_distr[phase] * well_surfacerates_phase[np*self_index_ + phase];
                 }
-                const double my_rate_target = ctrls.target[ctrl_index];
+                const double my_rate_target = well_controls_iget_target(ctrls , ctrl_index);
                 ctrl_violated = std::fabs(my_rate) > std::fabs(my_rate_target);
                 if (ctrl_violated) {
                     std::cout << "SURFACE_RATE limit violated for well " << name() << ":\n";
@@ -742,9 +747,7 @@ namespace Opm
     void WellNode::shutWell()
     {
         if (shut_well_) {
-        	// We set the tilde of the current control
-            // set_current_control(self_index_, -1, wells_);
-        	wells_->ctrls[self_index_]->current = ~ wells_->ctrls[self_index_]->current;
+            well_controls_shut_well( wells_->ctrls[self_index_]);
         }
         else {
             const double target = 0.0;
@@ -753,16 +756,16 @@ namespace Opm
             if (group_control_index_ < 0) {
                 // The well only had its own controls, no group controls.
                 append_well_controls(SURFACE_RATE, target, distr, self_index_, wells_);
-                group_control_index_ = wells_->ctrls[self_index_]->num - 1;
+                group_control_index_ = well_controls_get_num(wells_->ctrls[self_index_]) - 1;
             } else {
                 // We will now modify the last control, that
                 // "belongs to" the group control.
-                const int np = wells_->number_of_phases;
-                wells_->ctrls[self_index_]->type[group_control_index_] = SURFACE_RATE;
-                wells_->ctrls[self_index_]->target[group_control_index_] = target;
-                std::copy(distr, distr + np, wells_->ctrls[self_index_]->distr + np * group_control_index_);
+                
+                well_controls_iset_type( wells_->ctrls[self_index_] , group_control_index_ , SURFACE_RATE);
+                well_controls_iset_target( wells_->ctrls[self_index_] , group_control_index_ , target);
+                well_controls_iset_distr(wells_->ctrls[self_index_] , group_control_index_ , distr);
             }
-            wells_->ctrls[self_index_]->current = ~ wells_->ctrls[self_index_]->current;
+            well_controls_open_well( wells_->ctrls[self_index_]);
         }
     }
 
@@ -808,14 +811,13 @@ namespace Opm
         if (group_control_index_ < 0) {
             // The well only had its own controls, no group controls.
             append_well_controls(wct, target, distr, self_index_, wells_);
-            group_control_index_ = wells_->ctrls[self_index_]->num - 1;
+            group_control_index_ = well_controls_get_num(wells_->ctrls[self_index_]) - 1;
         } else {
             // We will now modify the last control, that
             // "belongs to" the group control.
-            const int np = wells_->number_of_phases;
-            wells_->ctrls[self_index_]->type[group_control_index_] = wct;
-            wells_->ctrls[self_index_]->target[group_control_index_] = target;
-            std::copy(distr, distr + np, wells_->ctrls[self_index_]->distr + np*group_control_index_);
+            well_controls_iset_type(wells_->ctrls[self_index_] , group_control_index_ , wct);
+            well_controls_iset_target(wells_->ctrls[self_index_] , group_control_index_ ,target);
+            well_controls_iset_distr(wells_->ctrls[self_index_] , group_control_index_ , distr);
         }
         set_current_control(self_index_, group_control_index_, wells_);
     }
@@ -920,14 +922,13 @@ namespace Opm
         if (group_control_index_ < 0) {
             // The well only had its own controls, no group controls.
             append_well_controls(wct, ntarget, distr, self_index_, wells_);
-            group_control_index_ = wells_->ctrls[self_index_]->num - 1;
+            group_control_index_ = well_controls_get_num(wells_->ctrls[self_index_]) - 1;
         } else {
             // We will now modify the last control, that
             // "belongs to" the group control.
-            const int np = wells_->number_of_phases;
-            wells_->ctrls[self_index_]->type[group_control_index_] = wct;
-            wells_->ctrls[self_index_]->target[group_control_index_] = ntarget;
-            std::copy(distr, distr + np, wells_->ctrls[self_index_]->distr + np*group_control_index_);
+            well_controls_iset_type(wells_->ctrls[self_index_] , group_control_index_ , wct);
+            well_controls_iset_target(wells_->ctrls[self_index_] , group_control_index_ , ntarget);
+            well_controls_iset_distr(wells_->ctrls[self_index_] , group_control_index_ , distr);
         }
         set_current_control(self_index_, group_control_index_, wells_);
     }
@@ -1044,98 +1045,55 @@ namespace Opm
         }
     } // anonymous namespace
 
-    std::shared_ptr<WellsGroupInterface> createWellsGroup(const std::string& name,
-                                                               const EclipseGridParser& deck)
+    std::shared_ptr<WellsGroupInterface> createGroupWellsGroup(GroupConstPtr group, size_t timeStep, const PhaseUsage& phase_usage )
     {
-        PhaseUsage phase_usage = phaseUsageFromDeck(deck);
-
-        std::shared_ptr<WellsGroupInterface> return_value;
-        // First we need to determine whether it's a group or just a well:
-        bool isWell = false;
-        if (deck.hasField("WELSPECS")) {
-            WELSPECS wspecs = deck.getWELSPECS();
-            for (size_t i = 0; i < wspecs.welspecs.size(); i++) {
-                if (wspecs.welspecs[i].name_ == name) {
-                    isWell = true;
-                    break;
-                }
-            }
+        InjectionSpecification injection_specification;
+        ProductionSpecification production_specification;
+        if (group->isInjectionGroup(timeStep)) {
+            injection_specification.injector_type_ = toInjectorType(Phase::PhaseEnum2String(group->getInjectionPhase(timeStep)));
+            injection_specification.control_mode_ = toInjectionControlMode(GroupInjection::ControlEnum2String(group->getInjectionControlMode(timeStep)));
+            injection_specification.surface_flow_max_rate_ = group->getSurfaceMaxRate(timeStep);
+            injection_specification.reservoir_flow_max_rate_ = group->getReservoirMaxRate(timeStep);
+            injection_specification.reinjection_fraction_target_ = group->getTargetReinjectFraction(timeStep);
+            injection_specification.voidage_replacment_fraction_ = group->getTargetVoidReplacementFraction(timeStep);
         }
-        // For now, assume that if it isn't a well, it's a group
-
-        if (isWell) {
-            ProductionSpecification production_specification;
-            InjectionSpecification injection_specification;
-            if (deck.hasField("WCONINJE")) {
-                WCONINJE wconinje = deck.getWCONINJE();
-                for (size_t i = 0; i < wconinje.wconinje.size(); i++) {
-                    if (wconinje.wconinje[i].well_ == name) {
-                        WconinjeLine line = wconinje.wconinje[i];
-                        injection_specification.BHP_limit_ = line.BHP_limit_;
-                        injection_specification.injector_type_ = toInjectorType(line.injector_type_);
-                        injection_specification.control_mode_ = toInjectionControlMode(line.control_mode_);
-                        injection_specification.surface_flow_max_rate_ = line.surface_flow_max_rate_;
-                        injection_specification.reservoir_flow_max_rate_ = line.reservoir_flow_max_rate_;
-                        production_specification.guide_rate_ = 0.0; // We know we're not a producer
-                    }
-                }
-            }
-
-            if (deck.hasField("WCONPROD")) {
-                WCONPROD wconprod = deck.getWCONPROD();
-                for (size_t i = 0; i < wconprod.wconprod.size(); i++) {
-                    if (wconprod.wconprod[i].well_ == name) {
-                        WconprodLine line = wconprod.wconprod[i];
-                        production_specification.BHP_limit_ = line.BHP_limit_;
-                        production_specification.reservoir_flow_max_rate_ = line.reservoir_flow_max_rate_;
-                        production_specification.oil_max_rate_ = line.oil_max_rate_;
-                        production_specification.control_mode_ = toProductionControlMode(line.control_mode_);
-                        production_specification.water_max_rate_ = line.water_max_rate_;
-                        injection_specification.guide_rate_ = 0.0; // we know we're not an injector
-                    }
-                }
-            }
-            return_value.reset(new WellNode(name, production_specification, injection_specification, phase_usage));
-        } else {
-            InjectionSpecification injection_specification;
-            if (deck.hasField("GCONINJE")) {
-                GCONINJE gconinje = deck.getGCONINJE();
-                for (size_t i = 0; i < gconinje.gconinje.size(); i++) {
-                    if (gconinje.gconinje[i].group_ == name) {
-                        GconinjeLine line = gconinje.gconinje[i];
-                        injection_specification.injector_type_ = toInjectorType(line.injector_type_);
-                        injection_specification.control_mode_ = toInjectionControlMode(line.control_mode_);
-                        injection_specification.surface_flow_max_rate_ = line.surface_flow_max_rate_;
-                        injection_specification.reservoir_flow_max_rate_ = line.resv_flow_max_rate_;
-                        injection_specification.reinjection_fraction_target_ = line.reinjection_fraction_target_;
-                        injection_specification.voidage_replacment_fraction_ = line.voidage_replacement_fraction_;
-                    }
-                }
-            }
-
-            ProductionSpecification production_specification;
-            if (deck.hasField("GCONPROD")) {
-                std::cout << "Searching in gconprod " << std::endl;
-                std::cout << "name= " << name << std::endl;
-                GCONPROD gconprod = deck.getGCONPROD();
-                for (size_t i = 0; i < gconprod.gconprod.size(); i++) {
-                    if (gconprod.gconprod[i].group_ == name) {
-                        GconprodLine line = gconprod.gconprod[i];
-                        production_specification.oil_max_rate_ = line.oil_max_rate_;
-                        std::cout << "control_mode = " << line.control_mode_ << std::endl;
-                        production_specification.control_mode_ = toProductionControlMode(line.control_mode_);
-                        production_specification.water_max_rate_ = line.water_max_rate_;
-                        production_specification.gas_max_rate_ = line.gas_max_rate_;
-                        production_specification.liquid_max_rate_ = line.liquid_max_rate_;
-                        production_specification.procedure_ = toProductionProcedure(line.procedure_);
-                        production_specification.reservoir_flow_max_rate_ = line.resv_max_rate_;
-                    }
-                }
-            }
-
-            return_value.reset(new WellsGroup(name, production_specification, injection_specification, phase_usage));
+        else if (group->isProductionGroup(timeStep)) {
+            production_specification.oil_max_rate_ = group->getOilTargetRate(timeStep);
+            production_specification.control_mode_ = toProductionControlMode(GroupProduction::ControlEnum2String(group->getProductionControlMode(timeStep)));
+            production_specification.water_max_rate_ = group->getWaterTargetRate(timeStep);
+            production_specification.gas_max_rate_ = group->getGasTargetRate(timeStep);
+            production_specification.liquid_max_rate_ = group->getLiquidTargetRate(timeStep);
+            production_specification.procedure_ = toProductionProcedure(GroupProductionExceedLimit::ActionEnum2String(group->getProductionExceedLimitAction(timeStep)));
+            production_specification.reservoir_flow_max_rate_ = group->getReservoirMaxRate(timeStep);
         }
 
-        return return_value;
+        std::shared_ptr<WellsGroupInterface> wells_group(new WellsGroup(group->name(), production_specification, injection_specification, phase_usage));
+        return wells_group;
+    }
+
+    std::shared_ptr<WellsGroupInterface> createWellWellsGroup(WellConstPtr well, size_t timeStep, const PhaseUsage& phase_usage )
+    {
+        InjectionSpecification injection_specification;
+        ProductionSpecification production_specification;
+        if (well->isInjector(timeStep)) {
+            const WellInjectionProperties& properties = well->getInjectionProperties(timeStep);
+            injection_specification.BHP_limit_ = properties.BHPLimit;
+            injection_specification.injector_type_ = toInjectorType(WellInjector::Type2String(properties.injectorType));
+            injection_specification.control_mode_ = toInjectionControlMode(WellInjector::ControlMode2String(properties.controlMode));
+            injection_specification.surface_flow_max_rate_ = properties.surfaceInjectionRate;
+            injection_specification.reservoir_flow_max_rate_ = properties.reservoirInjectionRate;
+            production_specification.guide_rate_ = 0.0; // We know we're not a producer
+        }
+        else if (well->isProducer(timeStep)) {
+            const WellProductionProperties& properties = well->getProductionProperties(timeStep);
+            production_specification.BHP_limit_ = properties.BHPLimit;
+            production_specification.reservoir_flow_max_rate_ = properties.ResVRate;
+            production_specification.oil_max_rate_ = properties.OilRate;
+            production_specification.control_mode_ = toProductionControlMode(WellProducer::ControlMode2String(properties.controlMode));
+            production_specification.water_max_rate_ = properties.WaterRate;
+            injection_specification.guide_rate_ = 0.0; // we know we're not an injector
+        }
+        std::shared_ptr<WellsGroupInterface> wells_group(new WellNode(well->name(), production_specification, injection_specification, phase_usage));
+        return wells_group;
     }
 }

@@ -20,6 +20,8 @@
 #ifndef OPM_SIMULATORTIMER_HEADER_INCLUDED
 #define OPM_SIMULATORTIMER_HEADER_INCLUDED
 
+#include <opm/parser/eclipse/EclipseState/Schedule/TimeMap.hpp>
+
 #include <iosfwd>
 #include <vector>
 #include <boost/date_time/gregorian/gregorian.hpp>
@@ -29,8 +31,6 @@ namespace Opm
 {
 
     namespace parameter { class ParameterGroup; }
-    class EclipseGridParser;
-
 
     class SimulatorTimer
     {
@@ -43,25 +43,42 @@ namespace Opm
         ///    stepsize_days (default 1)
         void init(const parameter::ParameterGroup& param);
 
-        /// Initialize from TSTEP field.
-        /// Note that DATES are folded into TSTEP by the parser.
-        void init(const EclipseGridParser& deck);
+        /// Use the SimulatorTimer as a shim around opm-parser's Opm::TimeMap
+        void init(TimeMapConstPtr timeMap);
 
         /// Total number of steps.
         int numSteps() const;
 
-        /// Current step number.
+        /// Current step number. This is the number of timesteps that
+        /// has been completed from the start of the run. The time
+        /// after initialization but before the simulation has started
+        /// is timestep number zero.
         int currentStepNum() const;
 
         /// Set current step number.
         void setCurrentStepNum(int step);
 
-        /// Current step length.
-        /// Note: if done(), it is an error to call currentStepLength().
+        /// Current step length. This is the length of the step
+        /// the simulator will take in the next iteration.
+        ///
+        /// @note if done(), it is an error to call currentStepLength().
         double currentStepLength() const;
 
-        /// Current time.
-        double currentTime() const;
+        /// Previous step length. This is the length of the step that
+        /// was taken to arrive at this time.
+        ///
+        /// @note if no increments have been done (i.e. the timer is
+        /// still in its constructed state and currentStepNum() == 0),
+        /// it is an error to call stepLengthTaken().
+        double stepLengthTaken () const;
+
+        /// Time elapsed since the start of the POSIX epoch (Jan 1st,
+        /// 1970) until the current time step begins [s].
+        time_t currentPosixTime() const;
+
+        /// Time elapsed since the start of the simulation until the
+        /// beginning of the current time step [s].
+        double simulationTimeElapsed() const;
 
         /// Return the current time as a posix time object.
         boost::posix_time::ptime currentDateTime() const;

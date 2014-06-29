@@ -46,9 +46,7 @@ include (CMakeLists_files.cmake)
 
 macro (config_hook)
 #	opm_need_version_of ("dune-common")
-	list (APPEND ${project}_CONFIG_IMPL_VARS
-		HAVE_DUNE_ISTL
-		)
+  opm_need_version_of ("dune-istl")
 endmacro (config_hook)
 
 macro (prereqs_hook)
@@ -72,6 +70,12 @@ macro (sources_hook)
 			${PROJECT_SOURCE_DIR}/tutorials/tutorial4.cpp
 			)
 	endif (NOT SuiteSparse_FOUND)
+
+	if ((NOT MPI_FOUND) OR (NOT DUNE_ISTL_FOUND))
+		list (REMOVE_ITEM tests_SOURCES
+			${PROJECT_SOURCE_DIR}/tests/test_parallel_linearsolver.cpp
+			)
+	endif ((NOT MPI_FOUND) OR (NOT DUNE_ISTL_FOUND))
 
 	# we are not supposed to include the TinyXML test prog. regardless
 	list (REMOVE_ITEM opm-core_SOURCES
@@ -103,6 +107,9 @@ endmacro (sources_hook)
 macro (fortran_hook)
 endmacro (fortran_hook)
 
+macro (files_hook)
+endmacro (files_hook)
+
 macro (tests_hook)
 	cond_disable_test ("ERT")
 endmacro (tests_hook)
@@ -117,3 +124,5 @@ endmacro (install_hook)
 
 # all setup common to the OPM library modules is done here
 include (OpmLibMain)
+
+

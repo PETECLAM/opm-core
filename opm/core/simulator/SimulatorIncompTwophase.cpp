@@ -40,6 +40,8 @@
 #include <opm/core/utility/Event.hpp>
 
 #include <opm/core/wells/WellsManager.hpp>
+#include <opm/core/well_controls.h>
+#include <opm/core/wells.h>
 
 #include <opm/core/props/IncompPropertiesInterface.hpp>
 #include <opm/core/props/rock/RockCompressibility.hpp>
@@ -308,8 +310,8 @@ namespace Opm
         const int nw = wells->number_of_wells;
         for (int w = 0; w < nw; ++w) {
             const WellControls* wc = wells->ctrls[w];
-            if (wc->current >= 0) {
-                if (wc->type[wc->current] == BHP) {
+            if (well_controls_well_is_open( wc )) {
+                if (well_controls_get_current_type(wc) == BHP) {
                     return false;
                 }
             }
@@ -452,7 +454,7 @@ namespace Opm
             std::string filename = output_dir_ + "/step_timing.param";
             tstep_os.open(filename.c_str(), std::fstream::out | std::fstream::app);
         }
-        for (; !timer.done(); ++timer) {
+        while (!timer.done()) {
             // Report timestep and (optionally) write state to disk.
             step_timer.start();
             timer.report(*log_);
@@ -576,12 +578,12 @@ namespace Opm
                     dynamic_cast<TransportSolverTwophaseReorder&>(*tsolver_)
                         .solveGravity(&initial_porevol[0], stepsize, state);
                 }
-                watercut.push(timer.currentTime() + timer.currentStepLength(),
+                watercut.push(timer.simulationTimeElapsed() + timer.currentStepLength(),
                               produced[0]/(produced[0] + produced[1]),
                               tot_produced[0]/tot_porevol_init);
                 if (wells_) {
                     wellreport.push(props_, *wells_, state.saturation(),
-                                    timer.currentTime() + timer.currentStepLength(),
+                                    timer.simulationTimeElapsed() + timer.currentStepLength(),
                                     well_state.bhp(), well_state.perfRates());
                 }
             }
@@ -604,6 +606,10 @@ namespace Opm
             if (output_) {
                 sreport.reportParam(tstep_os);
             }
+
+            // advance the timer to the end of the timestep *before* notifying
+            // the client that the timestep is done
+            ++timer;
 
             // notify all clients that we are done with the timestep
             callback_timer.start ();

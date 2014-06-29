@@ -46,7 +46,8 @@ namespace Opm
                                const int* ja,
                                const double* sa,
                                const double* rhs,
-                               double* solution) const
+                               double* solution,
+                               const boost::any&) const
     {
         CSRMatrix A  = {
             (size_t)size,
@@ -56,7 +57,7 @@ namespace Opm
             const_cast<double*>(sa)
         };
         call_UMFPACK(&A, rhs, solution);
-        LinearSolverReport rep = {0};
+        LinearSolverReport rep = {};
         rep.converged = true;
         return rep;
     }

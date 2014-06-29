@@ -1,8 +1,7 @@
 #include "config.h"
-#include <iostream>
-#include <opm/core/io/eclipse/EclipseGridParser.hpp>
-#include <opm/core/utility/parameters/ParameterGroup.hpp>
 
+#include <iostream>
+#include <opm/core/utility/parameters/ParameterGroup.hpp>
 
 #include <opm/core/simulator/initState.hpp>
 #include <opm/core/simulator/SimulatorTimer.hpp>
@@ -19,6 +18,10 @@
 #include <opm/core/linalg/LinearSolverFactory.hpp>
 #include <opm/core/props/rock/RockCompressibility.hpp>
 
+#include <opm/parser/eclipse/Parser/Parser.hpp>
+#include <opm/parser/eclipse/Deck/Deck.hpp>
+#include <opm/parser/eclipse/EclipseState/Schedule/Schedule.hpp>
+
 int main(int argc, char** argv)
 try
 {
@@ -31,17 +34,20 @@ try
     simtimer.init(parameters);
 
     // Read input file
-    EclipseGridParser parser(file_name);
+    Opm::ParserPtr parser(new Opm::Parser());
+    Opm::DeckConstPtr deck = parser->parseFile(file_name);
+    Opm::EclipseStateConstPtr eclipseState(new Opm::EclipseState(deck));
     std::cout << "Done!" << std::endl;
+
     // Setup grid
-    GridManager grid(parser);
+    GridManager grid(deck);
 
     // Define rock and fluid properties
-    IncompPropertiesFromDeck incomp_properties(parser, *grid.c_grid());
-    RockCompressibility rock_comp(parser);
+    IncompPropertiesFromDeck incomp_properties(deck, eclipseState, *grid.c_grid());
+    RockCompressibility rock_comp(deck);
 
     // Finally handle the wells
-    WellsManager wells(parser, *grid.c_grid(), incomp_properties.permeability());
+    WellsManager wells(eclipseState , 0 , *grid.c_grid(), incomp_properties.permeability());
 
     double gravity[3] = {0.0, 0.0, parameters.getDefault<double>("gravity", 0.0)};
     Opm::LinearSolverFactory linsolver(parameters);
@@ -70,7 +76,7 @@ try
 
     Opm::TwophaseState state;
 
-    initStateFromDeck(*grid.c_grid(), incomp_properties, parser, gravity[2], state);
+    initStateFromDeck(*grid.c_grid(), incomp_properties, deck, gravity[2], state);
 
     Opm::WellState well_state;
     well_state.init(wells.c_wells(), state);

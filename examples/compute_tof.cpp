@@ -47,6 +47,9 @@
 #include <opm/core/tof/TofReorder.hpp>
 #include <opm/core/tof/TofDiscGalReorder.hpp>
 
+#include <opm/parser/eclipse/Parser/Parser.hpp>
+#include <opm/parser/eclipse/EclipseState/Schedule/Schedule.hpp>
+
 #include <memory>
 #include <boost/filesystem.hpp>
 
@@ -68,7 +71,6 @@ namespace
     }
 
     void buildTracerheadsFromWells(const Wells* wells,
-                                   const Opm::WellState& well_state,
                                    Opm::SparseTable<int>& tracerheads)
     {
         if (wells == 0) {
@@ -102,7 +104,7 @@ try
 
     // If we have a "deck_filename", grid and props will be read from that.
     bool use_deck = param.has("deck_filename");
-    std::unique_ptr<EclipseGridParser> deck;
+    Opm::DeckConstPtr deck;
     std::unique_ptr<GridManager> grid;
     std::unique_ptr<IncompPropertiesInterface> props;
     std::unique_ptr<Opm::WellsManager> wells;
@@ -112,20 +114,23 @@ try
     double gravity[3] = { 0.0 };
     if (use_deck) {
         std::string deck_filename = param.get<std::string>("deck_filename");
-        deck.reset(new EclipseGridParser(deck_filename));
+        Opm::ParserPtr parser(new Opm::Parser());
+        deck = parser->parseFile(deck_filename);
+        Opm::EclipseStateConstPtr eclipseState(new Opm::EclipseState(deck));
+
         // Grid init
-        grid.reset(new GridManager(*deck));
+        grid.reset(new GridManager(deck));
         // Rock and fluid init
-        props.reset(new IncompPropertiesFromDeck(*deck, *grid->c_grid()));
+        props.reset(new IncompPropertiesFromDeck(deck, eclipseState, *grid->c_grid()));
         // Wells init.
-        wells.reset(new Opm::WellsManager(*deck, *grid->c_grid(), props->permeability()));
+        wells.reset(new Opm::WellsManager(eclipseState , 0 , *grid->c_grid(), props->permeability()));
         // Gravity.
-        gravity[2] = deck->hasField("NOGRAV") ? 0.0 : unit::gravity;
+        gravity[2] = deck->hasKeyword("NOGRAV") ? 0.0 : unit::gravity;
         // Init state variables (saturation and pressure).
         if (param.has("init_saturation")) {
             initStateBasic(*grid->c_grid(), *props, param, gravity[2], state);
         } else {
-            initStateFromDeck(*grid->c_grid(), *props, *deck, gravity[2], state);
+            initStateFromDeck(*grid->c_grid(), *props, deck, gravity[2], state);
         }
     } else {
         // Grid init.
@@ -257,7 +262,7 @@ try
     std::vector<double> tracer;
     Opm::SparseTable<int> tracerheads;
     if (compute_tracer) {
-        buildTracerheadsFromWells(wells->c_wells(), well_state, tracerheads);
+        buildTracerheadsFromWells(wells->c_wells(), tracerheads);
     }
     if (use_dg) {
         if (compute_tracer) {

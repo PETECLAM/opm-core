@@ -22,6 +22,7 @@
 #include <opm/core/utility/Units.hpp>
 #include <opm/core/grid.h>
 #include <opm/core/wells.h>
+#include <opm/core/well_controls.h>
 #include <opm/core/props/IncompPropertiesInterface.hpp>
 #include <opm/core/props/BlackoilPropertiesInterface.hpp>
 #include <opm/core/props/rock/RockCompressibility.hpp>
@@ -44,14 +45,9 @@ namespace Opm
                            const double* porosity,
                            std::vector<double>& porevol)
     {
-        int num_cells = grid.number_of_cells;
-        porevol.resize(num_cells);
-        std::transform(porosity, porosity + num_cells,
-                       grid.cell_volumes,
-                       porevol.begin(),
-                       std::multiplies<double>());
+        computePorevolume(grid.number_of_cells, grid.cell_volumes,
+                          porosity, porevol);
     }
-
 
     /// @brief Computes pore volume of all cells in a grid, with rock compressibility effects.
     /// @param[in]  grid      a grid
@@ -65,12 +61,10 @@ namespace Opm
                            const std::vector<double>& pressure,
                            std::vector<double>& porevol)
     {
-        int num_cells = grid.number_of_cells;
-        porevol.resize(num_cells);
-        for (int i = 0; i < num_cells; ++i) {
-            porevol[i] = porosity[i]*grid.cell_volumes[i]*rock_comp.poroMult(pressure[i]);
-        }
+        computePorevolume(grid.number_of_cells, grid.cell_volumes, porosity, rock_comp, pressure,
+                          porevol);
     }
+
 
     /// @brief Computes porosity of all cells in a grid, with rock compressibility effects.
     /// @param[in]  grid               a grid
@@ -400,24 +394,16 @@ namespace Opm
                               const std::vector<double>& face_flux,
                               std::vector<double>& cell_velocity)
     {
-        const int dim = grid.dimensions;
-        cell_velocity.clear();
-        cell_velocity.resize(grid.number_of_cells*dim, 0.0);
-        for (int face = 0; face < grid.number_of_faces; ++face) {
-            int c[2] = { grid.face_cells[2*face], grid.face_cells[2*face + 1] };
-            const double* fc = &grid.face_centroids[face*dim];
-            double flux = face_flux[face];
-            for (int i = 0; i < 2; ++i) {
-                if (c[i] >= 0) {
-                    const double* cc = &grid.cell_centroids[c[i]*dim];
-                    for (int d = 0; d < dim; ++d) {
-                        double v_contrib = fc[d] - cc[d];
-                        v_contrib *= flux/grid.cell_volumes[c[i]];
-                        cell_velocity[c[i]*dim + d] += (i == 0) ? v_contrib : -v_contrib;
-                    }
-                }
-            }
-        }
+        estimateCellVelocity(grid.number_of_cells,
+                             grid.number_of_faces,
+                             grid.face_centroids,
+                             UgGridHelpers::faceCells(grid),
+                             grid.cell_centroids,
+                             grid.cell_volumes,
+                             grid.dimensions,
+                             face_flux,
+                             cell_velocity);
+        
     }
 
     /// Extract a vector of water saturations from a vector of
@@ -457,22 +443,25 @@ namespace Opm
         }
         src.resize(num_cells);
         for (int w = 0; w < wells.number_of_wells; ++w) {
-            const int cur = wells.ctrls[w]->current;
-            if (wells.ctrls[w]->num != 1) {
+            const int cur = well_controls_get_current(wells.ctrls[w]);
+            if (well_controls_get_num(wells.ctrls[w]) != 1) {
                 OPM_MESSAGE("In wellsToSrc(): well has more than one control, all but current control will be ignored.");
             }
-            if (wells.ctrls[w]->type[cur] != RESERVOIR_RATE) {
+            if (well_controls_iget_type(wells.ctrls[w] , cur) != RESERVOIR_RATE) {
                 OPM_THROW(std::runtime_error, "In wellsToSrc(): well is something other than RESERVOIR_RATE.");
             }
             if (wells.well_connpos[w+1] - wells.well_connpos[w] != 1) {
                 OPM_THROW(std::runtime_error, "In wellsToSrc(): well has multiple perforations.");
             }
-            for (int p = 0; p < np; ++p) {
-                if (wells.ctrls[w]->distr[np*cur + p] != 1.0) {
-                    OPM_THROW(std::runtime_error, "In wellsToSrc(): well not controlled on total rate.");
+            {
+                const double * distr = well_controls_iget_distr( wells.ctrls[w] , cur);
+                for (int p = 0; p < np; ++p) {
+                    if (distr[p] != 1.0) {
+                        OPM_THROW(std::runtime_error, "In wellsToSrc(): well not controlled on total rate.");
+                    }
                 }
             }
-            double flow = wells.ctrls[w]->target[cur];
+            double flow = well_controls_iget_target(wells.ctrls[w] , cur);
             if (wells.type[w] == INJECTOR) {
                 flow *= wells.comp_frac[np*w + 0]; // Obtaining water rate for inflow source.
             }
@@ -486,44 +475,8 @@ namespace Opm
                     const double* densities, const double gravity, const bool per_grid_cell,
                     std::vector<double>& wdp)
     {
-        const int nw = wells.number_of_wells;
-        const size_t np = per_grid_cell ?
-            saturations.size()/grid.number_of_cells
-            : saturations.size()/wells.well_connpos[nw];
-        // Simple for now:
-        for (int i = 0; i < nw; i++) {
-            double depth_ref = wells.depth_ref[i];
-            for (int j = wells.well_connpos[i]; j < wells.well_connpos[i + 1]; j++) {
-                int cell = wells.well_cells[j];
-
-                // Is this correct wrt. depth_ref?
-                double cell_depth = grid.cell_centroids[3 * cell + 2];
-
-                double saturation_sum = 0.0;
-                for (size_t p = 0; p < np; p++) {
-                    if (!per_grid_cell) {
-                        saturation_sum += saturations[j * np + p];
-                    } else {
-                        saturation_sum += saturations[np * cell + p];
-                    }
-                }
-                if (saturation_sum == 0) {
-                    saturation_sum = 1.0;
-                }
-                double density = 0.0;
-                for (size_t p = 0; p < np; p++) {
-                    if (!per_grid_cell) {
-                        density += saturations[j * np + p] * densities[p] / saturation_sum;
-                    } else {
-                        // Is this a smart way of doing it?
-                        density += saturations[np * cell + p] * densities[p] / saturation_sum;
-                    }
-                }
-
-                // Is the sign correct?
-                wdp.push_back(density * (cell_depth - depth_ref) * gravity);
-            }
-        }
+        computeWDP(wells, grid.number_of_cells, grid.cell_centroids, saturations, densities,
+                   gravity, per_grid_cell, wdp);
     }
 
 

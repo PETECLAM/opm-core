@@ -23,13 +23,16 @@
 
 #include <opm/core/utility/parameters/ParameterGroup.hpp>
 #include <opm/core/grid.h>
-#include <opm/core/io/eclipse/EclipseGridParser.hpp>
+#include <opm/core/grid/GridHelpers.hpp>
 #include <opm/core/utility/ErrorMacros.hpp>
 #include <opm/core/utility/MonotCubicInterpolator.hpp>
 #include <opm/core/utility/Units.hpp>
 #include <opm/core/props/IncompPropertiesInterface.hpp>
 #include <opm/core/props/BlackoilPropertiesInterface.hpp>
 #include <opm/core/props/phaseUsageFromDeck.hpp>
+#include <opm/core/utility/miscUtilitiesBlackoil.hpp>
+
+#include <opm/parser/eclipse/Utility/EquilWrapper.hpp>
 
 #include <iostream>
 #include <cmath>
@@ -46,17 +49,21 @@ namespace Opm
         // Find the cells that are below and above a depth.
         // TODO: add 'anitialiasing', obtaining a more precise split
         //       by f. ex. subdividing cells cut by the split depths.
-        void cellsBelowAbove(const UnstructuredGrid& grid,
+       template<class T>
+        void cellsBelowAbove(int number_of_cells,
+                             T begin_cell_centroids,
+                             int dimension,
                              const double depth,
                              std::vector<int>& below,
                              std::vector<int>& above)
         {
-            const int num_cells = grid.number_of_cells;
-            below.reserve(num_cells);
-            above.reserve(num_cells);
-            const int dim = grid.dimensions;
-            for (int c = 0; c < num_cells; ++c) {
-                const double z = grid.cell_centroids[dim*c + dim - 1];
+            below.reserve(number_of_cells);
+            above.reserve(number_of_cells);
+            for (int c = 0; c < number_of_cells; ++c) {
+                const double z = UgGridHelpers
+                    ::getCoordinate(UgGridHelpers::increment(begin_cell_centroids, c,
+                                                             dimension),
+                                    dimension-1);
                 if (z > depth) {
                     below.push_back(c);
                 } else {
@@ -73,8 +80,10 @@ namespace Opm
         // Initialize saturations so that there is water below woc,
         // and oil above.
         // If invert is true, water is instead above, oil below.
-        template <class Props, class State>
-        void initWaterOilContact(const UnstructuredGrid& grid,
+        template <class T, class Props, class State>
+        void initWaterOilContact(int number_of_cells,
+                                 T begin_cell_centroids,
+                                 int dimensions,
                                  const Props& props,
                                  const double woc,
                                  const WaterInit waterinit,
@@ -90,10 +99,12 @@ namespace Opm
             // }
             switch (waterinit) {
             case WaterBelow:
-                cellsBelowAbove(grid, woc, water, oil);
+                cellsBelowAbove(number_of_cells, begin_cell_centroids, dimensions,
+                                woc, water, oil);
                 break;
             case WaterAbove:
-                cellsBelowAbove(grid, woc, oil, water);
+                cellsBelowAbove(number_of_cells, begin_cell_centroids, dimensions,
+                                woc, oil, water);
             }
             // Set saturations.
             state.setFirstSat(oil, props, State::MinSat);
@@ -112,8 +123,10 @@ namespace Opm
         // Note that by manipulating the densities parameter,
         // it is possible to initialise with water on top instead of
         // on the bottom etc.
-        template <class State>
-        void initHydrostaticPressure(const UnstructuredGrid& grid,
+        template <class T, class State>
+        void initHydrostaticPressure(int number_of_cells,
+                                     T begin_cell_centroids,
+                                     int dimensions,
                                      const double* densities,
                                      const double woc,
                                      const double gravity,
@@ -122,14 +135,14 @@ namespace Opm
                                      State& state)
         {
             std::vector<double>& p = state.pressure();
-            const int num_cells = grid.number_of_cells;
-            const int dim = grid.dimensions;
             // Compute pressure at woc
             const double rho_datum = datum_z > woc ? densities[0] : densities[1];
             const double woc_p = datum_p + (woc - datum_z)*gravity*rho_datum;
-            for (int c = 0; c < num_cells; ++c) {
+            for (int c = 0; c < number_of_cells; ++c) {
                 // Compute pressure as delta from woc pressure.
-                const double z = grid.cell_centroids[dim*c + dim - 1];
+                const double z = UgGridHelpers::
+                    getCoordinate(UgGridHelpers::increment(begin_cell_centroids, c, dimensions),
+                                  dimensions-1);
                 const double rho = z > woc ? densities[0] : densities[1];
                 p[c] = woc_p + (z - woc)*gravity*rho;
             }
@@ -138,8 +151,10 @@ namespace Opm
 
         // Facade to initHydrostaticPressure() taking a property object,
         // for similarity to initHydrostaticPressure() for compressible fluids.
-        template <class State>
-        void initHydrostaticPressure(const UnstructuredGrid& grid,
+        template <class T, class State>
+        void initHydrostaticPressure(int number_of_cells,
+                                     T begin_cell_centroids,
+                                     int dimensions,
                                      const IncompPropertiesInterface& props,
                                      const double woc,
                                      const double gravity,
@@ -148,7 +163,8 @@ namespace Opm
                                      State& state)
         {
             const double* densities = props.density();
-            initHydrostaticPressure(grid, densities, woc, gravity, datum_z, datum_p, state);
+            initHydrostaticPressure(number_of_cells, begin_cell_centroids, dimensions,
+                                    densities, woc, gravity, datum_z, datum_p, state);
         }
 
 
@@ -168,7 +184,7 @@ namespace Opm
                 double A[4] = { 0.0 };
                 props_.matrix(1, &pressure, surfvol[phase], cells, A, 0);
                 double rho[2] = { 0.0 };
-                props_.density(1, A, rho);
+                props_.density(1, A, cells, rho);
                 return rho[phase];
             }
         };
@@ -180,8 +196,10 @@ namespace Opm
         // where rho is the oil density above the woc, water density
         // below woc. Note that even if there is (immobile) water in
         // the oil zone, it does not contribute to the pressure there.
-        template <class State>
-        void initHydrostaticPressure(const UnstructuredGrid& grid,
+       template <class T, class State>
+        void initHydrostaticPressure(int number_of_cells,
+                                     T begin_cell_centroids,
+                                     int dimensions,
                                      const BlackoilPropertiesInterface& props,
                                      const double woc,
                                      const double gravity,
@@ -192,11 +210,11 @@ namespace Opm
             assert(props.numPhases() == 2);
 
             // Obtain max and min z for which we will need to compute p.
-            const int num_cells = grid.number_of_cells;
-            const int dim = grid.dimensions;
             double zlim[2] = { 1e100, -1e100 };
-            for (int c = 0; c < num_cells; ++c) {
-                const double z = grid.cell_centroids[dim*c + dim - 1];
+            for (int c = 0; c < number_of_cells; ++c) {
+                const double z = UgGridHelpers::
+                    getCoordinate(UgGridHelpers::increment(begin_cell_centroids, c, dimensions),
+                                  dimensions-1);;
                 zlim[0] = std::min(zlim[0], z);
                 zlim[1] = std::max(zlim[1], z);
             }
@@ -265,30 +283,42 @@ namespace Opm
 
             // Evaluate pressure at each cell centroid.
             std::vector<double>& p = state.pressure();
-            for (int c = 0; c < num_cells; ++c) {
-                const double z = grid.cell_centroids[dim*c + dim - 1];
+            for (int c = 0; c < number_of_cells; ++c) {
+                const double z = UgGridHelpers::
+                    getCoordinate(UgGridHelpers::increment(begin_cell_centroids, c, dimensions),
+                                  dimensions-1);
                 p[c] = press(z);
             }
         }
 
         // Initialize face pressures to distance-weighted average of adjacent cell pressures.
-        template <class State>
-        void initFacePressure(const UnstructuredGrid& grid,
+    template <class State, class FaceCells, class FCI, class CCI>
+        void initFacePressure(int dimensions,
+                              int number_of_faces,
+                              FaceCells face_cells,
+                              FCI begin_face_centroids,
+                              CCI begin_cell_centroids,
                               State& state)
         {
-            const int dim = grid.dimensions;
             const std::vector<double>& cp = state.pressure();
             std::vector<double>& fp = state.facepressure();
-            for (int f = 0; f < grid.number_of_faces; ++f) {
+            for (int f = 0; f < number_of_faces; ++f) {
                 double dist[2] = { 0.0, 0.0 };
                 double press[2] = { 0.0, 0.0 };
                 int bdy_idx = -1;
                 for (int j = 0; j < 2; ++j) {
-                    const int c = grid.face_cells[2*f + j];
+                    const int c = face_cells(f, j);
                     if (c >= 0) {
                         dist[j] = 0.0;
-                        for (int dd = 0; dd < dim; ++dd) {
-                            double diff = grid.face_centroids[dim*f + dd] - grid.cell_centroids[dim*c + dd];
+                        for (int dd = 0; dd < dimensions; ++dd) {
+                            double diff = UgGridHelpers::
+                                getCoordinate(UgGridHelpers::increment(begin_face_centroids, f,
+                                                                       dimensions),
+                                              dd)
+                                - UgGridHelpers::
+                                getCoordinate(UgGridHelpers::increment(begin_cell_centroids, c,
+                                                                       dimensions),
+                                              dd);
                             dist[j] += diff*diff;
                         }
                         dist[j] = std::sqrt(dist[j]);
@@ -317,11 +347,32 @@ namespace Opm
                         const double gravity,
                         State& state)
     {
+        initStateBasic(grid.number_of_cells, grid.global_cell, grid.cartdims,
+                       grid.number_of_faces, UgGridHelpers::faceCells(grid),
+                       grid.face_centroids, grid.cell_centroids,
+                       grid.dimensions, props, param,
+                       gravity, state);
+    }
+
+    template <class FaceCells, class CCI, class FCI, class State>
+    void initStateBasic(int number_of_cells,
+                        const int* global_cell,
+                        const int* cartdims,
+                        int number_of_faces,
+                        FaceCells face_cells,
+                        FCI begin_face_centroids,
+                        CCI begin_cell_centroids,
+                        int dimensions,
+                        const IncompPropertiesInterface& props,
+                        const parameter::ParameterGroup& param,
+                        const double gravity,
+                        State& state)
+{
         const int num_phases = props.numPhases();
         if (num_phases != 2) {
             OPM_THROW(std::runtime_error, "initStateTwophaseBasic(): currently handling only two-phase scenarios.");
         }
-        state.init(grid, num_phases);
+        state.init(number_of_cells, number_of_faces, num_phases);
         const int num_cells = props.numCells();
         // By default: initialise water saturation to minimum everywhere.
         std::vector<int> all_cells(num_cells);
@@ -335,11 +386,9 @@ namespace Opm
             // Initialise water saturation to max in the 'left' part.
             std::vector<int> left_cells;
             left_cells.reserve(num_cells/2);
-            const int *glob_cell = grid.global_cell;
-            const int* cd = grid.cartdims;
             for (int cell = 0; cell < num_cells; ++cell) {
-                const int gc = glob_cell == 0 ? cell : glob_cell[cell];
-                bool left = (gc % cd[0]) < cd[0]/2;
+                const int gc = global_cell == 0 ? cell : global_cell[cell];
+                bool left = (gc % cartdims[0]) < cartdims[0]/2;
                 if (left) {
                     left_cells.push_back(cell);
                 }
@@ -352,30 +401,34 @@ namespace Opm
             if (gravity == 0.0) {
                 std::cout << "**** Warning: running gravity segregation scenario, but gravity is zero." << std::endl;
             }
-            if (grid.cartdims[2] <= 1) {
+            if (cartdims[2] <= 1) {
                 std::cout << "**** Warning: running gravity segregation scenario, which expects nz > 1." << std::endl;
             }
             // Initialise water saturation to max *above* water-oil contact.
             const double woc = param.get<double>("water_oil_contact");
-            initWaterOilContact(grid, props, woc, WaterAbove, state);
+            initWaterOilContact(number_of_cells, begin_cell_centroids, dimensions,
+                                props, woc, WaterAbove, state);
             // Initialise pressure to hydrostatic state.
             const double ref_p = param.getDefault("ref_pressure", 100.0)*unit::barsa;
             double dens[2] = { props.density()[1], props.density()[0] };
-            initHydrostaticPressure(grid, dens, woc, gravity, woc, ref_p, state);
+            initHydrostaticPressure(number_of_cells, begin_cell_centroids, dimensions,
+                                    dens, woc, gravity, woc, ref_p, state);
         } else if (param.has("water_oil_contact")) {
             // Warn against error-prone usage.
             if (gravity == 0.0) {
                 std::cout << "**** Warning: running gravity convection scenario, but gravity is zero." << std::endl;
             }
-            if (grid.cartdims[2] <= 1) {
+            if (cartdims[2] <= 1) {
                 std::cout << "**** Warning: running gravity convection scenario, which expects nz > 1." << std::endl;
             }
             // Initialise water saturation to max below water-oil contact.
             const double woc = param.get<double>("water_oil_contact");
-            initWaterOilContact(grid, props, woc, WaterBelow, state);
+            initWaterOilContact(number_of_cells, begin_cell_centroids, dimensions,
+                                props, woc, WaterBelow, state);
             // Initialise pressure to hydrostatic state.
             const double ref_p = param.getDefault("ref_pressure", 100.0)*unit::barsa;
-            initHydrostaticPressure(grid, props.density(), woc, gravity, woc, ref_p, state);
+            initHydrostaticPressure(number_of_cells, begin_cell_centroids, dimensions,
+                                    props.density(), woc, gravity, woc, ref_p, state);
         } else if (param.has("init_saturation")) {
             // Initialise water saturation to init_saturation parameter.
             const double init_saturation = param.get<double>("init_saturation");
@@ -387,20 +440,23 @@ namespace Opm
             const double ref_p = param.getDefault("ref_pressure", 100.0)*unit::barsa;
             const double rho =  props.density()[0]*init_saturation + props.density()[1]*(1.0 - init_saturation);
             const double dens[2] = { rho, rho };
-            const double ref_z = grid.cell_centroids[0 + grid.dimensions - 1];
-            initHydrostaticPressure(grid, dens, ref_z, gravity, ref_z, ref_p, state);
+            const double ref_z = UgGridHelpers::getCoordinate(begin_cell_centroids, dimensions - 1);
+            initHydrostaticPressure(number_of_cells, begin_cell_centroids, dimensions,
+                                    dens, ref_z, gravity, ref_z, ref_p, state);
         } else {
             // Use default: water saturation is minimum everywhere.
             // Initialise pressure to hydrostatic state.
             const double ref_p = param.getDefault("ref_pressure", 100.0)*unit::barsa;
             const double rho =  props.density()[1];
             const double dens[2] = { rho, rho };
-            const double ref_z = grid.cell_centroids[0 + grid.dimensions - 1];
-            initHydrostaticPressure(grid, dens, ref_z, gravity, ref_z, ref_p, state);
+            const double ref_z = UgGridHelpers::getCoordinate(begin_cell_centroids, dimensions - 1);
+            initHydrostaticPressure(number_of_cells, begin_cell_centroids, dimensions,
+                                    dens, ref_z, gravity, ref_z, ref_p, state);
         }
 
         // Finally, init face pressures.
-        initFacePressure(grid, state);
+        initFacePressure(dimensions, number_of_faces, face_cells, begin_face_centroids,
+                         begin_cell_centroids, state);
     }
 
 
@@ -412,12 +468,32 @@ namespace Opm
                         const double gravity,
                         State& state)
     {
+        initStateBasic(grid.number_of_cells, grid.global_cell, grid.cartdims,
+                       grid.number_of_faces, UgGridHelpers::faceCells(grid), 
+                       grid.face_centroids, grid.cell_centroids, grid.dimensions,
+                       props, param, gravity, state);
+    }
+
+    template <class FaceCells, class FCI, class CCI, class State>
+    void initStateBasic(int number_of_cells,
+                        const int* global_cell,
+                        const int* cartdims,
+                        int number_of_faces,
+                        FaceCells face_cells,
+                        FCI begin_face_centroids,
+                        CCI begin_cell_centroids,
+                        int dimensions,
+                        const BlackoilPropertiesInterface& props,
+                        const parameter::ParameterGroup& param,
+                        const double gravity,
+                        State& state)
+    {
         // TODO: Refactor to exploit similarity with IncompProp* case.
         const int num_phases = props.numPhases();
         if (num_phases != 2) {
             OPM_THROW(std::runtime_error, "initStateTwophaseBasic(): currently handling only two-phase scenarios.");
         }
-        state.init(grid, num_phases);
+        state.init(number_of_cells, number_of_faces, num_phases);
         const int num_cells = props.numCells();
         // By default: initialise water saturation to minimum everywhere.
         std::vector<int> all_cells(num_cells);
@@ -430,11 +506,9 @@ namespace Opm
             // Initialise water saturation to max in the 'left' part.
             std::vector<int> left_cells;
             left_cells.reserve(num_cells/2);
-            const int *glob_cell = grid.global_cell;
-            const int* cd = grid.cartdims;
             for (int cell = 0; cell < num_cells; ++cell) {
-                const int gc = glob_cell == 0 ? cell : glob_cell[cell];
-                bool left = (gc % cd[0]) < cd[0]/2;
+                const int gc = global_cell == 0 ? cell : global_cell[cell];
+                bool left = (gc % cartdims[0]) < cartdims[0]/2;
                 if (left) {
                     left_cells.push_back(cell);
                 }
@@ -447,26 +521,30 @@ namespace Opm
             if (gravity == 0.0) {
                 std::cout << "**** Warning: running gravity convection scenario, but gravity is zero." << std::endl;
             }
-            if (grid.cartdims[2] <= 1) {
+            if (cartdims[2] <= 1) {
                 std::cout << "**** Warning: running gravity convection scenario, which expects nz > 1." << std::endl;
             }
             // Initialise water saturation to max below water-oil contact.
             const double woc = param.get<double>("water_oil_contact");
-            initWaterOilContact(grid, props, woc, WaterBelow, state);
+            initWaterOilContact(number_of_cells, begin_cell_centroids, dimensions,
+                                props, woc, WaterBelow, state);
             // Initialise pressure to hydrostatic state.
             const double ref_p = param.getDefault("ref_pressure", 100.0)*unit::barsa;
-            initHydrostaticPressure(grid, props, woc, gravity, woc, ref_p, state);
+            initHydrostaticPressure(number_of_cells, begin_cell_centroids, dimensions,
+                                    props, woc, gravity, woc, ref_p, state);
         } else {
             // Use default: water saturation is minimum everywhere.
             // Initialise pressure to hydrostatic state.
             const double ref_p = param.getDefault("ref_pressure", 100.0)*unit::barsa;
-            const double ref_z = grid.cell_centroids[0 + grid.dimensions - 1];
+            const double ref_z = UgGridHelpers::getCoordinate(begin_cell_centroids, dimensions - 1);
             const double woc = -1e100;
-            initHydrostaticPressure(grid, props, woc, gravity, ref_z, ref_p, state);
+            initHydrostaticPressure(number_of_cells, begin_cell_centroids, dimensions,
+                                    props, woc, gravity, ref_z, ref_p, state);
         }
 
         // Finally, init face pressures.
-        initFacePressure(grid, state);
+        initFacePressure(dimensions, number_of_faces, face_cells, begin_face_centroids,
+                         begin_cell_centroids, state);
     }
 
 
@@ -474,7 +552,26 @@ namespace Opm
     template <class Props, class State>
     void initStateFromDeck(const UnstructuredGrid& grid,
                            const Props& props,
-                           const EclipseGridParser& deck,
+                           Opm::DeckConstPtr deck,
+                           const double gravity,
+                           State& state)
+    {
+        initStateFromDeck(grid.number_of_cells, grid.global_cell,
+                          grid.number_of_faces, UgGridHelpers::faceCells(grid),
+                          grid.face_centroids, grid.cell_centroids, grid.dimensions,
+                          props, deck, gravity, state);
+    }
+    /// Initialize a state from input deck.
+    template <class FaceCells, class FCI, class CCI, class Props, class State>
+    void initStateFromDeck(int number_of_cells,
+                           const int* global_cell,
+                           int number_of_faces,
+                           FaceCells face_cells,
+                           FCI begin_face_centroids,
+                           CCI begin_cell_centroids,
+                           int dimensions,
+                           const Props& props,
+                           Opm::DeckConstPtr deck,
                            const double gravity,
                            State& state)
     {
@@ -484,8 +581,13 @@ namespace Opm
             OPM_THROW(std::runtime_error, "initStateFromDeck():  user specified property object with " << num_phases << " phases, "
                   "found " << pu.num_phases << " phases in deck.");
         }
-        state.init(grid, num_phases);
-        if (deck.hasField("EQUIL")) {
+        state.init(number_of_cells, number_of_faces, num_phases);
+        if (deck->hasKeyword("EQUIL") && deck->hasKeyword("PRESSURE")) {
+            OPM_THROW(std::runtime_error, "initStateFromDeck(): The deck must either specify the initial "
+                      "condition using the PRESSURE _or_ the EQUIL keyword (currently it has both)");
+        }
+
+        if (deck->hasKeyword("EQUIL")) {
             if (num_phases != 2) {
                 OPM_THROW(std::runtime_error, "initStateFromDeck(): EQUIL-based init currently handling only two-phase scenarios.");
             }
@@ -493,64 +595,66 @@ namespace Opm
                 OPM_THROW(std::runtime_error, "initStateFromDeck(): EQUIL-based init currently handling only oil-water scenario (no gas).");
             }
             // Set saturations depending on oil-water contact.
-            const EQUIL& equil= deck.getEQUIL();
-            if (equil.equil.size() != 1) {
+            EquilWrapper equil(deck->getKeyword("EQUIL"));
+            if (equil.numRegions() != 1) {
                 OPM_THROW(std::runtime_error, "initStateFromDeck(): No region support yet.");
             }
-            const double woc = equil.equil[0].water_oil_contact_depth_;
-            initWaterOilContact(grid, props, woc, WaterBelow, state);
+            const double woc = equil.waterOilContactDepth(0);
+            initWaterOilContact(number_of_cells, begin_cell_centroids, dimensions,
+                                props, woc, WaterBelow, state);
             // Set pressure depending on densities and depths.
-            const double datum_z = equil.equil[0].datum_depth_;
-            const double datum_p = equil.equil[0].datum_depth_pressure_;
-            initHydrostaticPressure(grid, props, woc, gravity, datum_z, datum_p, state);
-        } else if (deck.hasField("PRESSURE")) {
+            const double datum_z = equil.datumDepth(0);
+            const double datum_p = equil.datumDepthPressure(0);
+            initHydrostaticPressure(number_of_cells, begin_cell_centroids, dimensions,
+                                    props, woc, gravity, datum_z, datum_p, state);
+        } else if (deck->hasKeyword("PRESSURE")) {
             // Set saturations from SWAT/SGAS, pressure from PRESSURE.
             std::vector<double>& s = state.saturation();
             std::vector<double>& p = state.pressure();
-            const std::vector<double>& p_deck = deck.getFloatingPointValue("PRESSURE");
-            const int num_cells = grid.number_of_cells;
+            const std::vector<double>& p_deck = deck->getKeyword("PRESSURE")->getSIDoubleData();
+            const int num_cells = number_of_cells;
             if (num_phases == 2) {
                 if (!pu.phase_used[BlackoilPhases::Aqua]) {
                     // oil-gas: we require SGAS
-                    if (!deck.hasField("SGAS")) {
+                    if (!deck->hasKeyword("SGAS")) {
                         OPM_THROW(std::runtime_error, "initStateFromDeck(): missing SGAS keyword in 2-phase init");
                     }
-                    const std::vector<double>& sg_deck = deck.getFloatingPointValue("SGAS");
+                    const std::vector<double>& sg_deck = deck->getKeyword("SGAS")->getSIDoubleData();
                     const int gpos = pu.phase_pos[BlackoilPhases::Vapour];
                     const int opos = pu.phase_pos[BlackoilPhases::Liquid];
                     for (int c = 0; c < num_cells; ++c) {
-                        int c_deck = (grid.global_cell == NULL) ? c : grid.global_cell[c];
+                        int c_deck = (global_cell == NULL) ? c : global_cell[c];
                         s[2*c + gpos] = sg_deck[c_deck];
                         s[2*c + opos] = 1.0 - sg_deck[c_deck];
                         p[c] = p_deck[c_deck];
                     }
                 } else {
                     // water-oil or water-gas: we require SWAT
-                    if (!deck.hasField("SWAT")) {
+                    if (!deck->hasKeyword("SWAT")) {
                         OPM_THROW(std::runtime_error, "initStateFromDeck(): missing SWAT keyword in 2-phase init");
                     }
-                    const std::vector<double>& sw_deck = deck.getFloatingPointValue("SWAT");
+                    const std::vector<double>& sw_deck = deck->getKeyword("SWAT")->getSIDoubleData();
                     const int wpos = pu.phase_pos[BlackoilPhases::Aqua];
                     const int nwpos = (wpos + 1) % 2;
                     for (int c = 0; c < num_cells; ++c) {
-                        int c_deck = (grid.global_cell == NULL) ? c : grid.global_cell[c];
+                        int c_deck = (global_cell == NULL) ? c : global_cell[c];
                         s[2*c + wpos] = sw_deck[c_deck];
                         s[2*c + nwpos] = 1.0 - sw_deck[c_deck];
                         p[c] = p_deck[c_deck];
                     }
                 }
             } else if (num_phases == 3) {
-                const bool has_swat_sgas = deck.hasField("SWAT") && deck.hasField("SGAS");
+                const bool has_swat_sgas = deck->hasKeyword("SWAT") && deck->hasKeyword("SGAS");
                 if (!has_swat_sgas) {
                     OPM_THROW(std::runtime_error, "initStateFromDeck(): missing SGAS or SWAT keyword in 3-phase init.");
                 }
                 const int wpos = pu.phase_pos[BlackoilPhases::Aqua];
                 const int gpos = pu.phase_pos[BlackoilPhases::Vapour];
                 const int opos = pu.phase_pos[BlackoilPhases::Liquid];
-                const std::vector<double>& sw_deck = deck.getFloatingPointValue("SWAT");
-                const std::vector<double>& sg_deck = deck.getFloatingPointValue("SGAS");
+                const std::vector<double>& sw_deck = deck->getKeyword("SWAT")->getSIDoubleData();
+                const std::vector<double>& sg_deck = deck->getKeyword("SGAS")->getSIDoubleData();
                 for (int c = 0; c < num_cells; ++c) {
-                    int c_deck = (grid.global_cell == NULL) ? c : grid.global_cell[c];
+                    int c_deck = (global_cell == NULL) ? c : global_cell[c];
                     s[3*c + wpos] = sw_deck[c_deck];
                     s[3*c + opos] = 1.0 - (sw_deck[c_deck] + sg_deck[c_deck]);
                     s[3*c + gpos] = sg_deck[c_deck];
@@ -564,12 +668,9 @@ namespace Opm
         }
 
         // Finally, init face pressures.
-        initFacePressure(grid, state);
+        initFacePressure(dimensions, number_of_faces, face_cells, begin_face_centroids,
+                         begin_cell_centroids, state);
     }
-
-
-
-
 
     /// Initialize surface volume from pressure and saturation by z = As.
     /// Here  saturation is used as an intial guess for z in the
@@ -579,9 +680,17 @@ namespace Opm
                              const Props& props,
                              State& state)
     {
+        initBlackoilSurfvol(grid.number_of_cells, props, state);
+    }
+
+    template <class Props, class State>
+    void initBlackoilSurfvol(int number_of_cells,
+                             const Props& props,
+                             State& state)
+    {
         state.surfacevol() = state.saturation();
         const int np = props.numPhases();
-        const int nc = grid.number_of_cells;
+        const int nc = number_of_cells;
         std::vector<double> allA(nc*np*np);
         std::vector<int> allcells(nc);
         for (int c = 0; c < nc; ++c) {
@@ -606,39 +715,57 @@ namespace Opm
                 }
             }
         }
-    }
-
+    }   
     /// Initialize surface volume from pressure and saturation by z = As.
-    /// Here the RS factor is used to compute an intial z for the
-    /// computation of A.
+    /// Here the solution gas/oil ratio or vapor oil/gas ratio is used to
+    /// compute an intial z for the computation of A.
     template <class Props, class State>
-    void initBlackoilSurfvol(const UnstructuredGrid& grid,
-                             const BlackoilPropertiesInterface& props,
+    void initBlackoilSurfvolUsingRSorRV(const UnstructuredGrid& grid,
+                             const Props& props,
                              State& state)
     {
+        initBlackoilSurfvolUsingRSorRV(grid.number_of_cells, props, state);
+    }
+
+    template <class Props, class State>
+    void initBlackoilSurfvolUsingRSorRV(int number_of_cells,
+                                        const Props& props,
+                                        State& state)
+    {
+        
         if (props.numPhases() != 3) {
             OPM_THROW(std::runtime_error, "initBlackoilSurfvol() is only supported in three-phase simulations.");
         }
-
         const std::vector<double>& rs = state.gasoilratio();
+        const std::vector<double>& rv = state.rv();
 
         //make input for computation of the A matrix
         state.surfacevol() = state.saturation();
-        //const PhaseUsage pu = phaseUsageFromDeck(deck);
         const PhaseUsage pu = props.phaseUsage();
 
         const int np = props.numPhases();
-        const int nc = grid.number_of_cells;
-        std::vector<double> allA_a(nc*np*np);
-        std::vector<double> allA_l(nc*np*np);
-        std::vector<double> allA_v(nc*np*np);
 
-        std::vector<int> allcells(nc);
-        std::vector<double> z_init(nc*np);
+        std::vector<double> allA_a(number_of_cells*np*np);
+        std::vector<double> allA_l(number_of_cells*np*np);
+        std::vector<double> allA_v(number_of_cells*np*np);
+
+        std::vector<int> allcells(number_of_cells);
+        std::vector<double> z_init(number_of_cells*np);
         std::fill(z_init.begin(),z_init.end(),0.0);
 
-        for (int c = 0; c < nc; ++c) {
+        for (int c = 0; c < number_of_cells; ++c) {
             allcells[c] = c;
+        }
+
+        std::vector<double> capPressures(number_of_cells*np);
+        props.capPress(number_of_cells,&state.saturation()[0],&allcells[0],&capPressures[0],NULL);
+
+        std::vector<double> Pw(number_of_cells);
+        std::vector<double> Pg(number_of_cells);
+
+        for (int c = 0; c < number_of_cells; ++c){
+            Pw[c] = state.pressure()[c] + capPressures[c*np + BlackoilPhases::Aqua];
+            Pg[c] = state.pressure()[c] + capPressures[c*np + BlackoilPhases::Vapour];
         }
 
 
@@ -646,7 +773,7 @@ namespace Opm
 
         // Water phase
         if(pu.phase_used[BlackoilPhases::Aqua])
-           for (int c = 0; c <  nc ; ++c){
+           for (int c = 0; c <  number_of_cells ; ++c){
                for (int p = 0; p < np ; ++p){
                    if (p == BlackoilPhases::Aqua)
                        z_tmp = 1;
@@ -656,11 +783,11 @@ namespace Opm
                    z_init[c*np + p] = z_tmp;
                }
            }
-        props.matrix(nc, &state.pressure()[0], &z_init[0], &allcells[0], &allA_a[0], 0);
+        props.matrix(number_of_cells, &state.pressure()[0], &z_init[0], &allcells[0], &allA_a[0], 0);
 
         // Liquid phase
         if(pu.phase_used[BlackoilPhases::Liquid]){
-            for (int c = 0; c <  nc ; ++c){
+            for (int c = 0; c <  number_of_cells ; ++c){
                 for (int p = 0; p < np ; ++p){
                      if(p == BlackoilPhases::Vapour){
                          if(state.saturation()[np*c + p] > 0)
@@ -678,16 +805,16 @@ namespace Opm
                 }
             }
         }
-        props.matrix(nc, &state.pressure()[0], &z_init[0], &allcells[0], &allA_l[0], 0);
+        props.matrix(number_of_cells, &state.pressure()[0], &z_init[0], &allcells[0], &allA_l[0], 0);
 
         if(pu.phase_used[BlackoilPhases::Vapour]){
-            for (int c = 0; c <  nc ; ++c){
+            for (int c = 0; c <  number_of_cells ; ++c){
                 for (int p = 0; p < np ; ++p){
                      if(p == BlackoilPhases::Liquid){
                          if(state.saturation()[np*c + p] > 0)
                              z_tmp = 1e10;
                          else
-                             z_tmp = rs[c];
+                             z_tmp = rv[c];
                      }
                      else if(p == BlackoilPhases::Vapour)
                          z_tmp = 1;
@@ -699,9 +826,9 @@ namespace Opm
                 }
             }
         }
-        props.matrix(nc, &state.pressure()[0], &z_init[0], &allcells[0], &allA_v[0], 0);
+        props.matrix(number_of_cells, &state.pressure()[0], &z_init[0], &allcells[0], &allA_v[0], 0);
 
-        for (int c = 0; c < nc; ++c) {
+        for (int c = 0; c < number_of_cells; ++c) {
             // Using z = As
             double* z = &state.surfacevol()[c*np];
             const double* s = &state.saturation()[c*np];
@@ -717,34 +844,67 @@ namespace Opm
                 z[2] += A_v[2 + np*col]*s[col];
 
             }
+            double ztmp = z[2];
             z[2] += z[1]*rs[c];
+            z[1] += ztmp*rv[c];
 
         }
     }
-
 
     /// Initialize a blackoil state from input deck.
     template <class Props, class State>
     void initBlackoilStateFromDeck(const UnstructuredGrid& grid,
                                    const Props& props,
-                                   const EclipseGridParser& deck,
+                                   Opm::DeckConstPtr deck,
                                    const double gravity,
                                    State& state)
     {
-        initStateFromDeck(grid, props, deck, gravity, state);
-        if (deck.hasField("RS")) {
-            const std::vector<double>& rs_deck = deck.getFloatingPointValue("RS");
-            const int num_cells = grid.number_of_cells;
-            for (int c = 0; c < num_cells; ++c) {
-                int c_deck = (grid.global_cell == NULL) ? c : grid.global_cell[c];
-                state.gasoilratio()[c] = rs_deck[c_deck];
-            }
-            initBlackoilSurfvol(grid, props, state);
-        } else {
-            OPM_THROW(std::runtime_error, "Temporarily, we require the RS field.");
-        }
+        initBlackoilStateFromDeck(grid.number_of_cells, grid.global_cell,
+                                  grid.number_of_faces, UgGridHelpers::faceCells(grid),
+                                  grid.face_centroids, grid.cell_centroids,grid.dimensions,
+                                  props, deck, gravity, state);
     }
 
+    /// Initialize a blackoil state from input deck.
+    template <class FaceCells, class FCI, class CCI, class Props, class State>
+    void initBlackoilStateFromDeck(int number_of_cells,
+                                   const int* global_cell,
+                                   int number_of_faces,
+                                   FaceCells face_cells,
+                                   FCI begin_face_centroids,
+                                   CCI begin_cell_centroids,
+                                   int dimensions,
+                                   const Props& props,
+                                   Opm::DeckConstPtr deck,
+                                   const double gravity,
+                                   State& state)
+    {
+        initStateFromDeck(number_of_cells, global_cell, number_of_faces,
+                          face_cells, begin_face_centroids, begin_cell_centroids,
+                          dimensions, props, deck, gravity, state);
+        if (deck->hasKeyword("RS")) {
+            const std::vector<double>& rs_deck = deck->getKeyword("RS")->getSIDoubleData();
+            const int num_cells = number_of_cells;
+            for (int c = 0; c < num_cells; ++c) {
+                int c_deck = (global_cell == NULL) ? c : global_cell[c];
+                state.gasoilratio()[c] = rs_deck[c_deck];
+            }
+            initBlackoilSurfvolUsingRSorRV(number_of_cells, props, state);
+            computeSaturation(props,state);
+        } else if (deck->hasKeyword("RV")){
+            const std::vector<double>& rv_deck = deck->getKeyword("RV")->getSIDoubleData();
+            const int num_cells = number_of_cells;
+            for (int c = 0; c < num_cells; ++c) {
+                int c_deck = (global_cell == NULL) ? c : global_cell[c];
+                state.rv()[c] = rv_deck[c_deck];
+            }
+            initBlackoilSurfvolUsingRSorRV(number_of_cells, props, state);
+            computeSaturation(props,state);
+        }
+        else {
+            OPM_THROW(std::runtime_error, "Temporarily, we require the RS or the RV field.");
+        }
+    }
 
 } // namespace Opm
 

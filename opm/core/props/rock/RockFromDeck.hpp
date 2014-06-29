@@ -20,8 +20,8 @@
 #ifndef OPM_ROCKFROMDECK_HEADER_INCLUDED
 #define OPM_ROCKFROMDECK_HEADER_INCLUDED
 
+#include <opm/parser/eclipse/EclipseState/EclipseState.hpp>
 
-#include <opm/core/io/eclipse/EclipseGridParser.hpp>
 #include <vector>
 
 struct UnstructuredGrid;
@@ -35,13 +35,15 @@ namespace Opm
         /// Default constructor.
         RockFromDeck();
 
-        /// Initialize from deck and grid.
-        /// \param  deck         Deck input parser
-        /// \param  grid         Grid to which property object applies, needed for the
-        ///                      mapping from cell indices (typically from a processed grid)
-        ///                      to logical cartesian indices consistent with the deck.
-        void init(const EclipseGridParser& deck,
-                  const UnstructuredGrid& grid);
+        /// Initialize from deck and cell mapping.
+        /// \param  eclState        The EclipseState (processed deck) produced by the opm-parser code
+        /// \param  number_of_cells The number of cells in the grid.
+        /// \param  global_cell     The mapping fom local to global cell indices.
+        ///                         global_cell[i] is the corresponding global index of i.
+        /// \param  cart_dims       The size of the underlying cartesian grid.
+        void init(Opm::EclipseStateConstPtr eclState,
+                  int number_of_cells, const int* global_cell,
+                  const int* cart_dims);
 
         /// \return   D, the number of spatial dimensions. Always 3 for deck input.
         int numDimensions() const
@@ -70,11 +72,14 @@ namespace Opm
         }
 
     private:
-        void assignPorosity(const EclipseGridParser& parser,
-                            const UnstructuredGrid& grid);
-        void assignPermeability(const EclipseGridParser& parser,
-                                const UnstructuredGrid& grid,
-                                const double perm_threshold);
+        void assignPorosity(Opm::EclipseStateConstPtr eclState,
+                            int number_of_cells,
+                            const int* global_cell);
+        void assignPermeability(Opm::EclipseStateConstPtr eclState,
+                                int number_of_cells,
+                                const int* global_cell,
+                                const int* cart_dims,
+                                double perm_threshold);
 
         std::vector<double> porosity_;
         std::vector<double> permeability_;

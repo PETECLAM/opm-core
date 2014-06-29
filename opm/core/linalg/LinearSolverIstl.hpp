@@ -24,11 +24,10 @@
 #include <opm/core/linalg/LinearSolverInterface.hpp>
 #include <opm/core/utility/parameters/ParameterGroup.hpp>
 #include <string>
-
+#include <boost/any.hpp>
 
 namespace Opm
 {
-
 
     /// Concrete class encapsulating some dune-istl linear solvers.
     class LinearSolverIstl : public LinearSolverInterface
@@ -75,7 +74,8 @@ namespace Opm
                                          const int* ja,
                                          const double* sa,
                                          const double* rhs,
-                                         double* solution) const;
+                                         double* solution,
+                                         const boost::any& comm=boost::any()) const;
 
         /// Set tolerance for the residual in dune istl linear solver.
         /// \param[in] tol         tolerance value
@@ -86,6 +86,17 @@ namespace Opm
         virtual double getTolerance() const;
 
     private:
+        /// \brief Solve the linear system using ISTL
+        /// \param[in] opA The linear operator of the system to solve.
+        /// \param[out]    solution C array for storing the solution vector.
+        /// \param[in]     rhs C array containing the right hand side.
+        /// \param[in]     sp The scalar product to use.
+        /// \param[in]     comm The information about the parallel domain decomposition.
+        /// \param[in]     maxit The maximum number of iterations allowed.
+        template<class O, class S, class C>
+        LinearSolverReport solveSystem(O& opA, double* solution, const double *rhs,
+                                       S& sp, const C& comm, int maxit) const;
+
         double linsolver_residual_tolerance_;
         int linsolver_verbosity_;
         enum LinsolverType { CG_ILU0 = 0, CG_AMG = 1, BiCGStab_ILU0 = 2, FastAMG=3, KAMG=4 };

@@ -26,11 +26,11 @@
 
 namespace Opm
 {
-
-    IncompPropertiesFromDeck::IncompPropertiesFromDeck(const EclipseGridParser& deck,
+    IncompPropertiesFromDeck::IncompPropertiesFromDeck(Opm::DeckConstPtr deck,
+                                                       Opm::EclipseStateConstPtr eclState,
                                                        const UnstructuredGrid& grid)
     {
-        rock_.init(deck, grid);
+        rock_.init(eclState, grid.number_of_cells, grid.global_cell, grid.cartdims);
         pvt_.init(deck);
         satprops_.init(deck, grid, 200);
         if (pvt_.numPhases() != satprops_.numPhases()) {

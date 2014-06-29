@@ -6,6 +6,9 @@ set (dune-cornerpoint_CONFIG_VAR
 	DUNE_GRID_VERSION_MAJOR
 	DUNE_GRID_VERSION_MINOR
 	DUNE_GRID_VERSION_REVISION
+	DUNE_COMMON_VERSION_MAJOR
+	DUNE_COMMON_VERSION_MINOR
+	DUNE_COMMON_VERSION_REVISION
 	)
 
 # dependencies
@@ -15,8 +18,8 @@ set (dune-cornerpoint_DEPS
 	# compile with C++0x/11 support if available
 	"CXX11Features"
 	# various runtime library enhancements
-	"Boost 1.39.0
-		COMPONENTS date_time filesystem system unit_test_framework REQUIRED"
+	"Boost 1.44.0
+		COMPONENTS date_time filesystem system iostreams unit_test_framework REQUIRED"
 	# DUNE dependency
 	"dune-common REQUIRED;
 	dune-grid REQUIRED;
